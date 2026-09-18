@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "f00ddec"
+version = "0.1.0"
+description = "Decompiler for the PS Vita F00D security processor (Toshiba MeP)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [{ name = "zecoxao" }]
+keywords = ["f00d", "mep", "toshiba", "vita", "psvita", "decompiler", "ida", "reverse-engineering"]
+
+[project.urls]
+Homepage = "https://github.com/zecoxao/f00ddec"
+
+[project.scripts]
+f00ddec = "f00ddec.cli:main"
+
+[tool.setuptools]
+packages = ["f00ddec"]
+py-modules = ["f00ddec_plugin"]
