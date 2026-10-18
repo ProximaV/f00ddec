@@ -9,7 +9,7 @@ purely as a *decoder*, and lifting, control-flow recovery and code generation ar
 ours.
 
 ```
-decoder → lifter → cfg → opt → structure → cgen
+decoder → lifter → cfg → opt → frame → abi → cgen
 ```
 
 ## What it produces
@@ -42,6 +42,29 @@ Registers print as themselves (`r0..r12`, `tp`, `gp`, `sp`, and control register
 sign-extending loads); MeP compare-and-branch folds into relational `if`s; the
 `movh`+`or3`/`add3` address idiom folds to a single constant; loops become
 `while`/`do-while`; cross-function tail jumps render as `JUMPOUT(addr)`.
+
+### Stack frame and calling convention recovery
+
+The MeP EABI passes the first four integer arguments in `r1`–`r4` (the rest on
+the stack), returns a value in `r0`, uses `r8` as the frame pointer and `sp`
+(= r15) as the stack pointer, with the return address in the `lp` control
+register. `f00ddec` uses that to clean the output up towards Hex-Rays:
+
+* **Suppresses prologue & epilogue boilerplate**: the stack allocation
+  (`add sp,#-N` / `add sp,#N`), the frame-pointer setup (`r8 = sp`) and
+  callee-saved register save/restore pairs (`mem32[sp+off] = rX` … `rX =
+  mem32[sp+off]`) are filtered out.
+* **Resolves stack variables**: a slot `mem[sp+off]` becomes a local `var_off`
+  (typed `char`/`short`/`int` by access width) declared at the head of the body;
+  a stack address `sp + off` passed to a callee becomes `&var_off`.
+* **Infers function signatures**: backward liveness over `r1`–`r4` recovers the
+  argument count and a `r0` definition reaching a `ret` recovers the return type,
+  so a function reads `int sub_X(int r1, int *r2)` instead of `void sub_X(void)`,
+  with `return r0;`. A parameter dereferenced as a memory base is typed `int *`.
+* **Folds call-site arguments**: the `r1 = …; r2 = …; foo();` set-up run collapses
+  into `foo(r1, r2)`, capped by the callee's own recovered parameter count.
+
+This is a lightweight structural recovery, not full Hex-Rays variable coalescing.
 
 ## Two ways to run it
 
@@ -83,16 +106,21 @@ instructions that do not map cleanly onto C are printed honestly as pseudo-calls
   core ISA); unknown opcodes print as `<mnem>(...) /* unmodelled */`.
 * Entry discovery follows the reset/interrupt vectors and direct calls; indirect
   calls (`jsr (rn)`, jump tables) need seeding with `--entry`.
-* No stack-frame reconstruction; `hi`/`lo`, `sra` and rotates are intrinsics.
+* Stack-frame recovery is structural (no overlapping-slot coalescing); `hi`/`lo`,
+  `sra` and rotates remain intrinsics. Stack-passed arguments (5th+) aren't folded.
 
 ## Tests
 
 ```
 python tests/test_pipeline.py
+python tests/test_recover.py
 python tests/test_highlight.py
 ```
 
-Hand-assembled, so they need neither IDA nor a firmware dump.
+Hand-assembled, so they need neither IDA nor a firmware dump: they check decoder
+field extraction, that every first word decodes without raising, loop recovery,
+stack-frame and boilerplate suppression, parameter/return and pointer-parameter
+recovery, call-argument folding, and the token highlighter.
 
 ## Credits
 

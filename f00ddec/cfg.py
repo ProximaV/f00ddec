@@ -22,13 +22,14 @@ class Block:
 
 
 class Func:
-    __slots__ = ("entry", "blocks", "calls", "name")
+    __slots__ = ("entry", "blocks", "calls", "name", "locals")
 
     def __init__(self, entry):
         self.entry = entry
         self.blocks = {}
         self.calls = set()
         self.name = None
+        self.locals = {}
 
     def ordered(self):
         return [self.blocks[k] for k in sorted(self.blocks)]

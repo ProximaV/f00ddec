@@ -9,12 +9,15 @@ recovered.  Out-of-function tail jumps render as ``JUMPOUT(addr)``.
 
 from . import ir
 from . import structure as S
+from . import recover
+from . import frame
 
 
 class _Emit:
-    def __init__(self, namer, block_starts=frozenset()):
+    def __init__(self, namer, block_starts=frozenset(), returns_value=False):
         self.namer = namer
         self.block_starts = block_starts
+        self.returns_value = returns_value
         self.used_labels = set()
         self._pending = []
 
@@ -51,8 +54,10 @@ class _Emit:
         if isinstance(s, ir.Assign):
             return "%s = %s;" % (self.expr(s.dst), self.expr(s.src))
         if isinstance(s, ir.Call):
-            return "%s();" % self.namer.code(s.target) if s.target is not None \
-                else "(*%s)();" % self.expr(s.expr)
+            args = ", ".join(self.expr(a) for a in (s.args or []))
+            if s.target is not None:
+                return "%s(%s);" % (self.namer.code(s.target), args)
+            return "(*%s)(%s);" % (self.expr(s.expr), args)
         if isinstance(s, ir.Intrinsic):
             call = "%s(%s);" % (s.name, ", ".join(self.expr(a) for a in s.args))
             return call + ("   /* %s */" % s.note if s.note else "")
@@ -69,7 +74,7 @@ class _Emit:
             elif isinstance(n, S.SStmt):
                 self._pending.append((ind, pad + self.stmt(n.stmt), None))
             elif isinstance(n, S.SRet):
-                self._pending.append((ind, pad + "return;", None))
+                self._pending.append((ind, pad + ("return r0;" if self.returns_value else "return;"), None))
             elif isinstance(n, S.SGoto):
                 if n.ea in self.block_starts:
                     self.used_labels.add(n.ea)
@@ -130,12 +135,17 @@ class _Emit:
 
 
 def generate(func, tree, namer, banner=None):
-    em = _Emit(namer, block_starts=frozenset(func.blocks))
+    sig, _params, returns_value = recover.signature(func, namer.code(func.entry))
+    em = _Emit(namer, block_starts=frozenset(func.blocks), returns_value=returns_value)
     em.emit(tree, 1)
     body = em.flush()
     out = list(banner) if banner else []
-    out.append("void %s(void)" % namer.code(func.entry))
+    out.append(sig)
     out.append("{")
+    decls = frame.local_decls(func)
+    if decls:
+        out.extend(decls)
+        out.append("")
     out.extend(body)
     out.append("}")
     return out

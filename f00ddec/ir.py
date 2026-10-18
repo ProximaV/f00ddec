@@ -80,12 +80,13 @@ class Assign:
 
 
 class Call:
-    __slots__ = ("ea", "target", "expr")
+    __slots__ = ("ea", "target", "expr", "args")
 
-    def __init__(self, ea, target=None, expr=None):
+    def __init__(self, ea, target=None, expr=None, args=None):
         self.ea = ea
         self.target = target
         self.expr = expr
+        self.args = args          # list of argument exprs (filled by callargs pass)
 
 
 class Intrinsic:
