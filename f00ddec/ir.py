@@ -13,17 +13,26 @@ class Expr:
 
 
 class Const(Expr):
-    __slots__ = ("value",)
+    __slots__ = ("value", "name", "width")
 
-    def __init__(self, value):
+    def __init__(self, value, width="w", name=None):
         self.value = value & 0xFFFFFFFF
+        self.width = width
+        self.name = name
+
+    def __eq__(self, o):
+        return isinstance(o, Const) and o.value == self.value
+
+    def __hash__(self):
+        return hash(("const", self.value))
 
 
 class Reg(Expr):
-    __slots__ = ("name",)
+    __slots__ = ("name", "width")
 
-    def __init__(self, name):
+    def __init__(self, name, width="w"):
         self.name = name
+        self.width = width
 
     def __eq__(self, o):
         return isinstance(o, Reg) and o.name == self.name
@@ -32,15 +41,48 @@ class Reg(Expr):
         return hash(("reg", self.name))
 
 
+class Var(Expr):
+    """Virtual high-level variable (v0, v1, a0, arg_0, etc.)."""
+    __slots__ = ("name", "width")
+
+    def __init__(self, name, width="w"):
+        self.name = name
+        self.width = width
+
+    def __eq__(self, o):
+        return isinstance(o, Var) and o.name == self.name
+
+    def __hash__(self):
+        return hash(("var", self.name))
+
+
+class StackVar(Var):
+    """A stack frame variable or argument slot."""
+    __slots__ = ("offset", "is_arg")
+
+    def __init__(self, name, width="w", offset=0, is_arg=False):
+        super().__init__(name, width)
+        self.offset = offset
+        self.is_arg = is_arg
+
+    def __eq__(self, o):
+        return isinstance(o, StackVar) and o.name == self.name and o.offset == self.offset
+
+    def __hash__(self):
+        return hash(("stackvar", self.name, self.offset))
+
+
 class Mem(Expr):
     """Memory access; ``addr`` is an int (absolute) or an Expr (reg-based).
-    width in bytes (1/2/4); ``signed`` selects sign- vs zero-extension."""
-    __slots__ = ("addr", "width", "signed")
+    width in bytes (1/2/4); ``signed`` selects sign- vs zero-extension;
+    ``name`` is an optional symbolic name from IDA."""
+    __slots__ = ("addr", "width", "signed", "name")
 
-    def __init__(self, addr, width=4, signed=False):
+    def __init__(self, addr, width=4, signed=False, name=None):
         self.addr = addr
         self.width = width
         self.signed = signed
+        self.name = name
 
 
 class Bin(Expr):
@@ -80,13 +122,14 @@ class Assign:
 
 
 class Call:
-    __slots__ = ("ea", "target", "expr", "args")
+    __slots__ = ("ea", "target", "expr", "args", "is_tail")
 
-    def __init__(self, ea, target=None, expr=None, args=None):
+    def __init__(self, ea, target=None, expr=None, args=None, is_tail=False):
         self.ea = ea
         self.target = target
         self.expr = expr
         self.args = args          # list of argument exprs (filled by callargs pass)
+        self.is_tail = is_tail
 
 
 class Intrinsic:
@@ -125,8 +168,19 @@ class Branch:
         self.fallthrough = fallthrough
 
 
+class Switch:
+    __slots__ = ("ea", "expr", "cases", "default_ea")
+
+    def __init__(self, ea, expr, cases, default_ea=None):
+        self.ea = ea
+        self.expr = expr            # switch controlling Expr
+        self.cases = cases          # list of (case_val, target_ea)
+        self.default_ea = default_ea
+
+
 class Nop:
     __slots__ = ("ea",)
 
     def __init__(self, ea):
         self.ea = ea
+

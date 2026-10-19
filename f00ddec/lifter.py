@@ -18,19 +18,20 @@ def _reg(i):
 
 def op_expr(op):
     m = op.mode
+    name = getattr(op, "name", None)
     if m == "reg":
         return _reg(op.reg)
     if m == "imm":
-        return ir.Const(op.value)
+        return ir.Const(op.value, name=name)
     if m == "mem":
-        return ir.Mem(op.addr, op.width)
+        return ir.Mem(op.addr, op.width, name=name)
     if m == "phrase":
         return ir.Mem(_reg(op.base_reg), op.width)
     if m == "displ":
         base = _reg(op.base_reg)
         addr = base if op.disp == 0 else ir.Bin("+", base, ir.Const(op.disp))
         return ir.Mem(addr, op.width)
-    return ir.Const(op.addr)
+    return ir.Const(op.addr, name=name)
 
 
 _ALU = {"add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^",
@@ -86,12 +87,46 @@ def lift_insn(ins):
         w = 1 if m == "extub" else 2
         mask = (1 << (8 * w)) - 1
         return [ir.Assign(ea, e(0), ir.Bin("&", e(0), ir.Const(mask)))]
+    if m == "ldz":
+        return [ir.Assign(ea, e(0), ir.IntrExpr("ldz", [e(1)]))]
+    if m in ("ave", "min", "max", "minu", "maxu", "sadd", "saddu", "ssub", "ssubu",
+             "clip", "clipu", "fsft"):
+        return [ir.Assign(ea, e(0), ir.IntrExpr(m, [e(0), e(1)]))]
+    if m == "ssarb":
+        return [ir.Intrinsic(ea, "ssarb", [e(0)])]
+
+    # --- bit manipulation in memory ----------------------------------------
+    if m in ("bsetm", "bclrm", "bnotm"):
+        dst = op_expr(ops[0]); dst.width = 1
+        src = op_expr(ops[0]); src.width = 1
+        bit = 1 << (ops[1].value & 7)
+        if m == "bsetm":
+            rhs = ir.Bin("|", src, ir.Const(bit))
+        elif m == "bclrm":
+            rhs = ir.Bin("&", src, ir.Const((~bit) & 0xFF))
+        else:
+            rhs = ir.Bin("^", src, ir.Const(bit))
+        return [ir.Assign(ea, dst, rhs)]
+    if m == "btstm":
+        src = op_expr(ops[0]); src.width = 1
+        bit = 1 << (ops[1].value & 7)
+        return [ir.Assign(ea, ir.Reg("r0"), ir.Bin("&", src, ir.Const(bit)))]
+    if m == "tas":
+        mem_r = op_expr(ops[1]); mem_r.width = 1
+        mem_w = op_expr(ops[1]); mem_w.width = 1
+        return [ir.Assign(ea, e(0), mem_r), ir.Assign(ea, mem_w, ir.Const(1))]
 
     # --- multiply / divide (hi:lo) ----------------------------------------
     if m in ("mul", "mulu"):
         return [ir.Assign(ea, ir.Reg("lo"), ir.IntrExpr(m, [e(0), e(1)]))]
     if m in ("mulr", "mulru"):
         return [ir.Assign(ea, e(0), ir.IntrExpr(m, [e(0), e(1)]))]
+    if m in ("madd", "maddu"):
+        return [ir.Assign(ea, ir.Reg("lo"),
+                          ir.Bin("+", ir.Reg("lo"), ir.IntrExpr(m, [e(0), e(1)])))]
+    if m in ("maddr", "maddru"):
+        return [ir.Assign(ea, e(0),
+                          ir.Bin("+", ir.Reg("lo"), ir.IntrExpr(m, [e(0), e(1)])))]
     if m in ("div", "divu"):
         opd = "/" if m == "divu" else "s/"
         return [ir.Assign(ea, ir.Reg("lo"), ir.Bin(opd, e(0), e(1))),
@@ -121,13 +156,22 @@ def lift_insn(ins):
     if m == "bra":
         return [ir.Goto(ea, target_of(ins))]
     if m == "jmp":
+        if ins.switch_info is not None:
+            sw = ins.switch_info
+            if sw.idx_kind == "stack":
+                addr = (ir.Reg("sp") if sw.idx_val == 0
+                        else ir.Bin("+", ir.Reg("sp"), ir.Const(sw.idx_val)))
+                sw_expr = ir.Mem(addr, 4)
+            else:
+                sw_expr = _reg(sw.idx_val)
+            return [ir.Switch(ea, sw_expr, list(sw.cases), sw.default_ea)]
         t = target_of(ins)
         if t is not None:
             return [ir.Goto(ea, t)]
         return [ir.Intrinsic(ea, "jmp", [op_expr(ops[0])], note="indirect")]
-    if m in ("bsr",):
+    if m in ("bsr", "bsrv"):
         return [ir.Call(ea, target=target_of(ins))]
-    if m == "jsr":
+    if m in ("jsr", "jsrv"):
         return [ir.Call(ea, expr=op_expr(ops[0]))]
     if m in _CMP:
         tgt = target_of(ins)
@@ -136,16 +180,20 @@ def lift_insn(ins):
         else:
             cx = ir.Bin(_CMP[m], e(0), e(1))
         return [ir.Branch(ea, cx, tgt, ea + ins.size)]
-    if m in ("ret", "reti"):
+    if m in ("ret", "reti", "dret"):
         return [ir.Ret(ea, m)]
 
     # --- cpu control / misc ------------------------------------------------
-    if m in ("ei", "di", "sleep", "syncm", "swi", "break"):
+    if m in ("ei", "di", "sleep", "syncm", "synccp", "halt", "swi", "break",
+             "dbreak", "cache", "pref"):
         args = [op_expr(o) for o in ops]
         return [ir.Intrinsic(ea, m, args)]
-    if m in ("repeat", "erepeat"):
-        return [ir.Intrinsic(ea, m, [op_expr(o) for o in ops], note="hardware loop")]
+    if m == "repeat":
+        return [ir.Assign(ea, ir.Reg("rpc"), e(0))]
+    if m == "erepeat":
+        return [ir.Nop(ea)]
     if m == "nop":
         return [ir.Nop(ea)]
 
     return [ir.Intrinsic(ea, m, [op_expr(o) for o in ops], note="unmodelled")]
+

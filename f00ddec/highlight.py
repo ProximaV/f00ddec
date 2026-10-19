@@ -5,7 +5,9 @@ import ida_lines
 
 C_KEYWORDS = frozenset(("if", "else", "while", "do", "for", "return", "break",
                         "continue", "goto", "switch", "case", "default", "sizeof", "typedef"))
-C_TYPES = frozenset(("void", "char", "short", "int", "long", "unsigned", "signed", "const"))
+C_TYPES = frozenset(("void", "char", "short", "int", "long", "unsigned", "signed", "const",
+                        "u8", "u16", "u32", "uint8_t", "uint16_t", "uint32_t",
+                        "int8_t", "int16_t", "int32_t", "bool", "size_t"))
 INTRINSICS = frozenset(("control_bus_load", "control_bus_store", "sra", "abs",
                         "mul", "mulu", "mulr", "mulru", "sext", "ei", "di",
                         "sleep", "syncm", "swi", "repeat", "erepeat", "jmp",

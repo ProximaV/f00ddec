@@ -20,7 +20,7 @@ from . import ir
 ARG_REGS = ("r1", "r2", "r3", "r4")
 RET_REG = "r0"
 CALLER_SAVED = frozenset((
-    "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+    "r0", "r1", "r2", "r3", "r4",
     "lp", "hi", "lo",
 ))
 
@@ -52,6 +52,8 @@ def _use_def(stmt):
             _regs(stmt.dst.addr, use)
     elif isinstance(stmt, ir.Branch):
         _regs(stmt.cexpr, use)
+    elif isinstance(stmt, ir.Switch):
+        _regs(stmt.expr, use)
     elif isinstance(stmt, ir.Call):
         if stmt.expr is not None:
             _regs(stmt.expr, use)
@@ -62,19 +64,30 @@ def _use_def(stmt):
     return use, defn
 
 
-def _block_use_def(block):
+def _block_use_def(block, block_set=frozenset()):
     """Upward-exposed uses and the kill set for a whole block."""
     use, defn = set(), set()
     for s in block.stmts:
         u, d = _use_def(s)
         use |= (u - defn)      # used before defined in this block
         defn |= d
+    # Tail-call thunk: if the block jumps out of the function after setting rK (e.g. r3, r4),
+    # then r1..r(K-1) not defined in this block are passed through from the caller.
+    if block.term == "goto" and block.succ and block.succ[0][1] not in block_set:
+        hi_arg = -1
+        for idx, r in enumerate(ARG_REGS):
+            if r in defn:
+                hi_arg = idx
+        if hi_arg > 0:
+            use |= (set(ARG_REGS[:hi_arg]) - defn)
     return use, defn
 
 
 def live_in_entry(func):
     blocks = func.blocks
-    bud = {ea: _block_use_def(b) for ea, b in blocks.items()}
+    bset = frozenset(blocks)
+    bud = {ea: _block_use_def(b, bset) for ea, b in blocks.items()}
+
     live_in = {ea: set() for ea in blocks}
     changed = True
     while changed:
@@ -98,25 +111,40 @@ def params(func):
     for i, r in enumerate(ARG_REGS):
         if r in lin:
             hi = i
+    stack_args = getattr(func, "stack_args", None)
+    if stack_args:
+        return list(ARG_REGS)
     return list(ARG_REGS[:hi + 1])
 
 
-def returns_value(func):
-    """True if r0 is given a value that reaches a return.
+def _block_defines_ret(block):
+    """Return True if *block* ends with a live explicit value in `r0`."""
+    r0_live = False
+    for s in block.stmts:
+        if isinstance(s, ir.Assign) and isinstance(s.dst, ir.Reg) and s.dst.name == RET_REG:
+            # A relational `<` in a branch block is a condition temporary, not a return value
+            if isinstance(s.src, ir.Bin) and s.src.op == "<" and block.term == "branch":
+                continue
+            r0_live = True
+        elif isinstance(s, ir.Call):
+            if s.expr is not None and RET_REG in _regs(s.expr, set()):
+                # `r0` was loaded as the indirect call target `(*r0)()`
+                r0_live = False
+    return r0_live
 
-    A definition of r0 (an explicit assignment, or a call whose result lands in
-    r0) that can reach a `ret` block makes the function value-returning."""
-    defs = set()
-    for ea, b in func.blocks.items():
-        for s in b.stmts:
-            if isinstance(s, ir.Assign) and isinstance(s.dst, ir.Reg) and s.dst.name == RET_REG:
-                defs.add(ea); break
-            if isinstance(s, ir.Call):
-                defs.add(ea); break
+
+def returns_value(func):
+    """True if `r0` is given an explicit non-flag value that reaches a normal `ret`."""
+    rets = {
+        ea for ea, b in func.blocks.items()
+        if b.term == "ret" and any(isinstance(s, ir.Ret) and s.kind == "ret" for s in b.stmts)
+    }
+    if not rets:
+        return False
+    defs = {ea for ea, b in func.blocks.items() if _block_defines_ret(b)}
     if not defs:
         return False
     succ = {ea: [t for _, t in b.succ if t in func.blocks] for ea, b in func.blocks.items()}
-    rets = {ea for ea, b in func.blocks.items() if b.term == "ret"}
     pred = {ea: [] for ea in func.blocks}
     for ea, ss in succ.items():
         for t in ss:
@@ -128,11 +156,7 @@ def returns_value(func):
         for p in pred.get(n, ()):
             if p not in seen:
                 seen.add(p); work.append(p)
-    explicit = any(
-        isinstance(s, ir.Assign) and isinstance(s.dst, ir.Reg) and s.dst.name == RET_REG
-        for b in func.blocks.values() for s in b.stmts
-    )
-    return explicit and bool(defs & seen)
+    return bool(defs & seen)
 
 
 def _mem_bases(e, out):
@@ -165,6 +189,8 @@ def _dst_bases(s, bases):
             _mem_bases(s.dst, bases)
     elif isinstance(s, ir.Branch):
         _mem_bases(s.cexpr, bases)
+    elif isinstance(s, ir.Switch):
+        _mem_bases(s.expr, bases)
     elif isinstance(s, ir.Intrinsic):
         for a in s.args:
             _mem_bases(a, bases)
@@ -209,8 +235,13 @@ def _pointer_params(func, ps):
 
 
 def signature(func, name):
-    ps = params(func)
+    ps = list(params(func))
+    stack_args = getattr(func, "stack_args", None)
+    if stack_args:
+        for sname in sorted(stack_args, key=lambda n: int(n.split("_")[1], 16)):
+            ps.append(sname)
     ret = "int" if returns_value(func) else "void"
     ptr = _pointer_params(func, ps)
     args = ", ".join(("int *%s" % p if p in ptr else "int %s" % p) for p in ps) if ps else "void"
     return "%s %s(%s)" % (ret, name, args), ps, ret == "int"
+

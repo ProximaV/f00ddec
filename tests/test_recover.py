@@ -126,6 +126,96 @@ def test_callargs_arity_cap():
     print("ok  test_callargs_arity_cap")
 
 
+def test_two_step_sp_and_lp_spill():
+    # Two-step stack allocation:
+    # add sp, #-8
+    # r0 = lp
+    # mem32[sp + 4] = r0          (canonical slot +20 after second sp -= 16)
+    # add sp, #-16
+    # mem32[sp + 8] = r1          (local var_8)
+    # r0 = mem32[sp + 8]          (load var_8)
+    # r11 = mem32[sp + 20]        (restore saved lp)
+    # lp = r11
+    # add sp, #24
+    # ret
+    def slot(off):
+        return ir.Reg("sp") if off == 0 else ir.Bin("+", ir.Reg("sp"), ir.Const(off))
+
+    f = _func(0x700, [
+        ir.Assign(0x700, ir.Reg("sp"), ir.Bin("+", ir.Reg("sp"), ir.Const(0xFFFFFFF8))),
+        ir.Assign(0x702, ir.Reg("r0"), ir.Reg("lp")),
+        ir.Assign(0x704, ir.Mem(slot(4), 4), ir.Reg("r0")),
+        ir.Assign(0x706, ir.Reg("sp"), ir.Bin("+", ir.Reg("sp"), ir.Const(0xFFFFFFF0))),
+        ir.Assign(0x708, ir.Mem(slot(8), 4), ir.Reg("r1")),
+        ir.Assign(0x70A, ir.Reg("r0"), ir.Mem(slot(8), 4)),
+        ir.Assign(0x70C, ir.Reg("r11"), ir.Mem(slot(20), 4)),
+        ir.Assign(0x70E, ir.Reg("lp"), ir.Reg("r11")),
+        ir.Assign(0x710, ir.Reg("sp"), ir.Bin("+", ir.Reg("sp"), ir.Const(24))),
+        ir.Ret(0x712),
+    ])
+    frame.rewrite(f)
+    stmts = f.blocks[0x700].stmts
+    assert len(stmts) == 3, [type(s).__name__ for s in stmts]
+    assert isinstance(stmts[0].dst, ir.Reg) and stmts[0].dst.name == "var_8"
+    assert isinstance(stmts[1].src, ir.Reg) and stmts[1].src.name == "var_8"
+    assert frame.local_decls(f) == ["    int var_8;"]
+    print("ok  test_two_step_sp_and_lp_spill")
+
+
+def test_zero_arity_cap_and_clobber():
+    # 1. Callee known to take 0 args: r1 = 5 must NOT be folded into call
+    f0 = _func(0x800, [
+        ir.Assign(0x800, ir.Reg("r1"), ir.Const(5)),
+        ir.Call(0x804, target=0x950),
+        ir.Ret(0x808),
+    ])
+    callargs.rewrite(f0, {0x950: 0})
+    call0 = [s for s in f0.blocks[0x800].stmts if isinstance(s, ir.Call)][0]
+    assert call0.args == [], call0.args
+
+    # 2. Clobber check: r1 = r5 ; r5 = 99 ; call() -> r1 must NOT fold to stale r5
+    f1 = _func(0x850, [
+        ir.Assign(0x850, ir.Reg("r1"), ir.Reg("r5")),
+        ir.Assign(0x852, ir.Reg("r5"), ir.Const(99)),
+        ir.Call(0x854, target=0x960),
+        ir.Ret(0x858),
+    ])
+    callargs.rewrite(f1, {0x960: 1})
+    stmts1 = f1.blocks[0x850].stmts
+    call1 = [s for s in stmts1 if isinstance(s, ir.Call)][0]
+    assert len(call1.args) == 1 and isinstance(call1.args[0], ir.Reg) and call1.args[0].name == "r1"
+    # Setup `r1 = r5` must remain intact in block
+    assert any(isinstance(s, ir.Assign) and isinstance(s.dst, ir.Reg) and s.dst.name == "r1" for s in stmts1)
+    print("ok  test_zero_arity_cap_and_clobber")
+
+
+def test_tail_call_args():
+    # Tail call to sub_2000 with 4 args:
+    # sub_1000:
+    #   r3 = 0xA
+    #   r4 = 0x801D36
+    #   tail_call sub_2000
+    #   ret
+    # r1 and r2 are passthrough from incoming args, r3 and r4 are set locally.
+    f = _func(0x1000, [
+        ir.Assign(0x1000, ir.Reg("r3"), ir.Const(0xA)),
+        ir.Assign(0x1004, ir.Reg("r4"), ir.Const(0x801D36)),
+        ir.Call(0x1008, target=0x2000, is_tail=True),
+        ir.Ret(0x100C),
+    ])
+    callargs.rewrite(f, {0x2000: 4})
+    stmts = f.blocks[0x1000].stmts
+    assert len(stmts) == 2, [type(s).__name__ for s in stmts]
+    call = stmts[0]
+    assert isinstance(call, ir.Call) and call.is_tail
+    assert len(call.args) == 4
+    assert isinstance(call.args[0], ir.Reg) and call.args[0].name == "r1"
+    assert isinstance(call.args[1], ir.Reg) and call.args[1].name == "r2"
+    assert isinstance(call.args[2], ir.Const) and call.args[2].value == 0xA
+    assert isinstance(call.args[3], ir.Const) and call.args[3].value == 0x801D36
+    print("ok  test_tail_call_args")
+
+
 if __name__ == "__main__":
     test_params_and_return()
     test_void_leaf()
@@ -133,4 +223,7 @@ if __name__ == "__main__":
     test_frame_cleanup()
     test_callargs_fold()
     test_callargs_arity_cap()
+    test_two_step_sp_and_lp_spill()
+    test_zero_arity_cap_and_clobber()
+    test_tail_call_args()
     print("\nall tests passed")
