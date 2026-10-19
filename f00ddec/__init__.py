@@ -10,10 +10,10 @@ F00D dump.
     decoder -> lifter -> cfg -> opt -> structure -> cgen
 """
 
-from . import decoder, cfg, opt, frame, callargs, recover, structure, cgen, loader
+from . import decoder, cfg, opt, frame, callargs, recover, structure, cgen, loader, abi, vars, db
 from .names import Namer
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 BANNER = [
     "/*",
@@ -27,12 +27,13 @@ BANNER = [
 
 
 class Function:
-    def __init__(self, entry, name, func, tree, lines):
+    def __init__(self, entry, name, func, tree, lines, line_eas=None):
         self.entry = entry
         self.name = name
         self.cfg = func
         self.tree = tree
         self.lines = lines
+        self.line_eas = line_eas if line_eas is not None else getattr(lines, "line_eas", None)
 
 
 class Program:
@@ -55,16 +56,26 @@ def decompile_image(image, entries, base=0, code_names=None):
     insns, calls = decoder.decode(image, entries=entries, base=base)
     funcs = cfg.build_functions(insns, calls, extra_entries=entries)
     namer = Namer(code_names=code_names)
-    for f in funcs.values():
+
+    # 1. Pre-compute calling conventions and arities
+    arity = {}
+    for entry, f in funcs.items():
+        frame_info = frame.analyze_frame(f)
         opt.optimize(f)
-        frame.rewrite(f)
-    arity = {entry: len(recover.params(f)) for entry, f in funcs.items()}
+        sig = abi.analyze_calling_convention(f, frame_info=frame_info)
+        arity[entry] = len(sig.params)
+
+    # 2. Decompile each function with virtual variable recovery
     out = {}
     for entry, f in funcs.items():
+        frame_info = frame.analyze_frame(f)
         callargs.rewrite(f, arity)
+        opt.optimize(f)
+        sig = abi.analyze_calling_convention(f, frame_info=frame_info)
+        vars.recover_variables(f, sig, frame_info)
         tree = structure.structure(f)
-        out[entry] = Function(entry, namer.code(entry), f, tree,
-                              cgen.generate(f, tree, namer))
+        lines = cgen.generate(f, tree, namer, frame_info=frame_info, sig=sig)
+        out[entry] = Function(entry, namer.code(entry), f, tree, lines)
     return Program(image, base, insns, out, namer)
 
 
@@ -78,3 +89,9 @@ def decompile_file(path, base=None, extra_entries=(), **kw):
         entries.append(reset)
     entries += list(extra_entries)
     return decompile_image(image, entries=entries, base=base, **kw)
+
+
+def decompile_one(ea):
+    from . import ida_bridge
+    return ida_bridge.decompile_one(ea)
+

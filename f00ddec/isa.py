@@ -37,8 +37,9 @@ def is_32bit(hw0):
 
 COND_BRANCH = frozenset(("beq", "bne", "bnez", "beqz", "bnei", "beqi",
                          "blti", "bgei"))
-CALL = frozenset(("bsr", "jsr"))
-RET = frozenset(("ret", "reti"))
+CALL = frozenset(("bsr", "jsr", "bsrv", "jsrv"))
+RET = frozenset(("ret", "reti", "dret"))
 # unconditional intra-procedural transfers
 UNCOND = frozenset(("bra", "jmp"))
-STOP = frozenset(("bra", "jmp", "ret", "reti"))
+STOP = frozenset(("bra", "jmp", "ret", "reti", "dret"))
+

@@ -12,3 +12,7 @@ class Namer:
 
     def label(self, ea):
         return self.code_names.get(ea) or ("loc_%X" % ea)
+
+    def data(self, ea):
+        return self.code_names.get(ea)
+
