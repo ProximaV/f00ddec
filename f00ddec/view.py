@@ -8,7 +8,10 @@ Provides:
   - Linking / synchronizing with IDA's disassembly view (follows cursor across functions).
   - Jumping to disassembly and clicking through to callee functions ('Enter' / 'Space' / double-click).
   - Refreshing decompilation ('F5').
-- Reusable dockable window that updates in place during navigation.
+- Caret token occurrence highlighting using SCOLOR_EXTRA.
+- Navigation history stack (forward navigation on symbol click, back with 'Esc').
+- Decompiler window state persistence across IDA sessions via netnodes.
+- Automatic docking beside IDA View-A.
 """
 
 import re
@@ -24,6 +27,7 @@ _EA = re.compile(r"\b(?:loc_|sub_)([0-9A-Fa-f]+)\b")
 _ADDR_HEX = re.compile(r"\b0x([0-9A-Fa-f]{5,8})\b")
 _VIEW_TITLE = "f00ddec - Pseudocode"
 
+ACTION_DECOMPILE = "f00ddec:decompile"
 ACTION_RENAME = "f00ddec:rename_var"
 ACTION_SET_TYPE = "f00ddec:set_type"
 ACTION_TOGGLE_SYNC = "f00ddec:toggle_sync"
@@ -61,10 +65,8 @@ def _is_dark_theme():
 def _get_highlight_colors():
     """Return (asm_highlight_color, decomp_highlight_bg) based on active IDA theme."""
     if _is_dark_theme():
-        # Soft slate blue / dark cyan highlight in dark mode
         return 0x304855, 0x283848
     else:
-        # Soft sky blue / cyan highlight in light mode
         return 0xC0E0FF, 0xD0E8FF
 
 
@@ -133,6 +135,9 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         self._highlighted_asm_eas = set()
         self._sync_lock = False
         self.sync_with_disasm = db.get_sync_enabled()
+        self._nav_history = []
+        self._last_token = None
+        self._highlighted_token_lines = set()
 
     def build_or_refresh(self, fn):
         """Populate or update lines with decompiled Function fn."""
@@ -145,6 +150,8 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         self.ea_to_line = getattr(fn, "ea_to_line", {}) or {}
         self.raw_lines = list(fn.lines)
         self._selected_line = None
+        self._last_token = None
+        self._highlighted_token_lines.clear()
 
         self.ClearLines()
         fn_line_eas = getattr(fn, "line_eas", None) or getattr(fn.lines, "line_eas", None)
@@ -169,7 +176,6 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         if initial_stmt_line is not None and initial_stmt_line < len(self.raw_lines):
             self.select_line(initial_stmt_line, jump=True, update_asm=True, jump_asm=False)
         else:
-            # When selecting a function, position view at the top without highlighting row 0
             self._selected_line = None
             try:
                 self.Jump(0, 0)
@@ -204,14 +210,16 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         # Unhighlight previous decompiled line
         if prev_line is not None and prev_line != lineno and 0 <= prev_line < len(self.raw_lines):
             try:
-                self.EditLine(prev_line, highlight.colorize(self.raw_lines[prev_line]), bgcolor=0xFFFFFFFF)
+                colored = highlight.colorize(self.raw_lines[prev_line], highlight_ident=self._last_token)
+                self.EditLine(prev_line, colored, bgcolor=0xFFFFFFFF)
             except Exception:
                 pass
 
         # Highlight current decompiled line if it has content
         if self.raw_lines[lineno].strip():
             try:
-                self.EditLine(lineno, highlight.colorize(self.raw_lines[lineno]), bgcolor=decomp_bg)
+                colored = highlight.colorize(self.raw_lines[lineno], highlight_ident=self._last_token)
+                self.EditLine(lineno, colored, bgcolor=decomp_bg)
                 self.RefreshCurrent()
             except Exception:
                 pass
@@ -277,6 +285,49 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             except Exception:
                 pass
 
+    def _update_token_highlight(self):
+        """Highlight all occurrences of the identifier under caret across the view."""
+        if not self.raw_lines:
+            return
+        word, lineno = self.get_word_under_cursor()
+        active_token = None
+        if word and (word[0].isalpha() or word[0] == "_"):
+            if word not in highlight.C_KEYWORDS and word not in highlight.C_TYPES:
+                active_token = word
+
+        if active_token == self._last_token:
+            return
+
+        self._last_token = active_token
+        _, decomp_bg = _get_highlight_colors()
+
+        to_restore = set(self._highlighted_token_lines)
+        self._highlighted_token_lines.clear()
+
+        new_matching = set()
+        if active_token:
+            pat = re.compile(r"\b" + re.escape(active_token) + r"\b")
+            for idx, raw in enumerate(self.raw_lines):
+                if idx >= self.header_count and pat.search(raw):
+                    new_matching.add(idx)
+
+        affected = to_restore.union(new_matching)
+        for idx in affected:
+            if 0 <= idx < len(self.raw_lines):
+                try:
+                    colored = highlight.colorize(self.raw_lines[idx], highlight_ident=active_token)
+                    bg = decomp_bg if idx == self._selected_line else 0xFFFFFFFF
+                    self.EditLine(idx, colored, bgcolor=bg)
+                    if idx in new_matching:
+                        self._highlighted_token_lines.add(idx)
+                except Exception:
+                    pass
+        if affected:
+            try:
+                self.RefreshCurrent()
+            except Exception:
+                pass
+
     def sync_from_disasm_ea(self, ea):
         """Called when cursor moves in disassembly; syncs selection in decompiled view."""
         if self._sync_lock:
@@ -285,13 +336,11 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         if lineno is None:
             lineno = self._find_closest_line(ea)
 
-        # If cursor in disassembly is at the function entry or prologue (header lines),
-        # clear body statement highlight and position at top of function without highlighting row 0
         if lineno is None or lineno < self.header_count:
             if self._selected_line is not None:
                 if 0 <= self._selected_line < len(self.raw_lines):
                     try:
-                        self.EditLine(self._selected_line, highlight.colorize(self.raw_lines[self._selected_line]), bgcolor=0xFFFFFFFF)
+                        self.EditLine(self._selected_line, highlight.colorize(self.raw_lines[self._selected_line], highlight_ident=self._last_token), bgcolor=0xFFFFFFFF)
                     except Exception:
                         pass
                 self._selected_line = None
@@ -316,6 +365,7 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
 
     def on_cursor_changed(self):
         """Called when user clicks or navigates in decompiler window."""
+        self._update_token_highlight()
         if self._sync_lock:
             return
         pos = self.GetPos()
@@ -516,6 +566,8 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
                     if pfn and pfn.start_ea == target_ea:
                         _jumpto_disasm(target_ea)
                         if target_ea != self.current_func_ea:
+                            pos = self.GetPos()
+                            self._nav_history.append((self.current_func_ea, pos[0] if pos else 0, pos[1] if pos else 0))
                             self.show_func(target_ea)
                         return True
                     else:
@@ -532,6 +584,8 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
                     pfn = ida_funcs.get_func(target_ea)
                     _jumpto_disasm(target_ea)
                     if pfn and pfn.start_ea == target_ea and target_ea != self.current_func_ea:
+                        pos = self.GetPos()
+                        self._nav_history.append((self.current_func_ea, pos[0] if pos else 0, pos[1] if pos else 0))
                         self.show_func(target_ea)
                     return True
                 except ValueError:
@@ -585,9 +639,20 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             self.toggle_sync()
             return True
         if vkey == 27:  # Esc
+            if self._nav_history:
+                prev_ea, prev_line, prev_col = self._nav_history.pop()
+                self.show_func(prev_ea)
+                try:
+                    self.select_line(prev_line, jump=True, update_asm=True, jump_asm=True)
+                    self.Jump(prev_line, prev_col)
+                except Exception:
+                    pass
+                return True
             global _active_viewer
             self.clear_asm_highlights()
             _active_viewer = None
+            if self.current_func_ea is not None:
+                db.save_window_state(False, self.current_func_ea)
             self.Close()
             return True
         # Navigation keys: Up(38), Down(40), PageUp(33), PageDown(34), Home(36), End(35)
@@ -603,6 +668,62 @@ class _UiHooks(ida_kernwin.UI_Hooks):
     def __init__(self, view):
         super().__init__()
         self.view = view
+
+    def create_desktop_widget(self, title, cfg):
+        if title == _VIEW_TITLE:
+            global _active_viewer, _view_hooks
+            if _active_viewer is None or _active_viewer.GetWidget() is None:
+                v = _DecompilerView()
+                if v.Create(_VIEW_TITLE):
+                    _active_viewer = v
+                    _register_actions(_active_viewer)
+                    self.view = _active_viewer
+                    if _view_hooks is None:
+                        _view_hooks = _CustViewHooks(_active_viewer)
+                        _view_hooks.hook()
+                    else:
+                        _view_hooks.view = _active_viewer
+                    return _active_viewer.GetWidget()
+            else:
+                return _active_viewer.GetWidget()
+        return None
+
+    def desktop_applied(self, name, from_idb, type):
+        self._restore_from_state()
+
+    def database_inited(self, is_new_database):
+        self._restore_from_state()
+
+    def saving(self):
+        self._record_current_state()
+
+    def saved(self):
+        self._record_current_state()
+
+    def _record_current_state(self):
+        global _active_viewer
+        if _active_viewer is not None and _active_viewer.GetWidget() is not None:
+            pos = _active_viewer.GetPos() or (0, 0)
+            if _active_viewer.current_func_ea is not None:
+                db.save_window_state(True, _active_viewer.current_func_ea,
+                                     lineno=pos[0], col=pos[1])
+
+    def _restore_from_state(self):
+        global _active_viewer
+        state = db.load_window_state()
+        if not state.get("is_open") or not state.get("func_ea"):
+            return
+        func_ea = state["func_ea"]
+        lineno = state.get("lineno", 0)
+        col = state.get("col", 0)
+        if _active_viewer is not None and _active_viewer.GetWidget() is not None:
+            if _active_viewer.current_func_ea != func_ea or not _active_viewer.raw_lines:
+                _active_viewer.show_func(func_ea)
+            if lineno:
+                try:
+                    _active_viewer.Jump(lineno, col)
+                except Exception:
+                    pass
 
     def screen_ea_changed(self, ea, prev_ea):
         """Automatically follow current function in disassembly and sync line selection."""
@@ -625,10 +746,17 @@ class _UiHooks(ida_kernwin.UI_Hooks):
         if self.view and widget == self.view.GetWidget():
             global _active_viewer
             self.view.clear_asm_highlights()
+            if self.view.current_func_ea is not None:
+                db.save_window_state(False, self.view.current_func_ea)
             _active_viewer = None
 
     def finish_populating_widget_popup(self, widget, popup_handle):
         """Attach decompiler context actions to the right-click popup menu."""
+        wtype = ida_kernwin.get_widget_type(widget)
+        if wtype == ida_kernwin.BWN_DISASM:
+            ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_DECOMPILE)
+            return
+
         if not self.view:
             return
         view_widget = self.view.GetWidget()
@@ -687,12 +815,14 @@ def _register_actions(view):
 def show(function):
     """Open or refresh the dockable decompiler view for the specified function."""
     global _active_viewer, _ui_hooks, _view_hooks
+    first_create = False
     if _active_viewer is None or _active_viewer.GetWidget() is None:
         v = _DecompilerView()
         if not v.Create(_VIEW_TITLE):
             return None
         _active_viewer = v
         _register_actions(_active_viewer)
+        first_create = True
 
         if _ui_hooks is None:
             _ui_hooks = _UiHooks(_active_viewer)
@@ -708,7 +838,26 @@ def show(function):
 
     _active_viewer.build_or_refresh(function)
     _active_viewer.Show()
+
+    if first_create:
+        try:
+            ida_kernwin.set_dock_pos(_VIEW_TITLE, "IDA View-A", ida_kernwin.DP_RIGHT)
+        except Exception:
+            pass
+
+    if _active_viewer.current_func_ea is not None:
+        pos = _active_viewer.GetPos() or (0, 0)
+        db.save_window_state(True, _active_viewer.current_func_ea, lineno=pos[0], col=pos[1])
+
     return _active_viewer
+
+
+def init_hooks():
+    """Initialize UI hooks early (at plugin load) to support desktop/docking persistence."""
+    global _ui_hooks
+    if _ui_hooks is None:
+        _ui_hooks = _UiHooks(None)
+        _ui_hooks.hook()
 
 
 def show_listing(title, lines):
@@ -742,7 +891,7 @@ def cleanup():
         except Exception:
             pass
         _view_hooks = None
-    for action_id in [ACTION_RENAME, ACTION_SET_TYPE, ACTION_TOGGLE_SYNC, ACTION_JUMP_DISASM, ACTION_REFRESH]:
+    for action_id in [ACTION_DECOMPILE, ACTION_RENAME, ACTION_SET_TYPE, ACTION_TOGGLE_SYNC, ACTION_JUMP_DISASM, ACTION_REFRESH]:
         try:
             ida_kernwin.unregister_action(action_id)
         except Exception:

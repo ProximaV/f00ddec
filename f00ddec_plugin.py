@@ -6,7 +6,8 @@ into IDA's user plugin directory (``%APPDATA%\\Hex-Rays\\IDA Pro\\plugins\\``).
 Open the dump with a MeP processor module (the bundled ``mepf00d`` Python module,
 or IDA's native ``mep``):
 
-    Ctrl-Shift-S   decompile the function under the cursor
+    F5             decompile the function under the cursor (or refresh)
+    Ctrl-Shift-S   legacy decompile shortcut
     Ctrl-F5        decompile every function in the database
 """
 
@@ -24,8 +25,14 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-HOTKEY_ONE = "Ctrl-Shift-S"
+HOTKEY_DECOMPILE = "F5"
+HOTKEY_LEGACY = "Ctrl-Shift-S"
 HOTKEY_ALL = "Ctrl-F5"
+
+ACTION_DECOMPILE = "f00ddec:decompile"
+MENU_PSEUDOCODE_PATH = "View/Open subviews/Generate pseudocode"
+MENU_PLUGIN_PATH = "Edit/Plugins/F00D decompiler (f00ddec)"
+
 _views = []
 _hotkeys = []
 
@@ -37,6 +44,15 @@ def _is_mep():
         return False
 
 
+class _DecompileActionHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        _run_one()
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
 def _run_one():
     from f00ddec import ida_bridge, view
     if not _is_mep():
@@ -44,16 +60,24 @@ def _run_one():
                             "Open it with a MeP processor module (mepf00d or native mep).")
         return
     ea = ida_kernwin.get_screen_ea()
-    if ida_funcs.get_func(ea) is None:
-        ida_kernwin.warning("f00ddec: no function at 0x%X (press 'P')." % ea)
+    f = ida_funcs.get_func(ea) if (ea is not None and ea != ida_idaapi.BADADDR) else None
+
+    # If the pseudocode viewer is active and focused, get_screen_ea() can be BADADDR
+    if f is None and getattr(view, "_active_viewer", None) is not None and view._active_viewer.current_func_ea is not None:
+        start_ea = view._active_viewer.current_func_ea
+    elif f is not None:
+        start_ea = f.start_ea
+    else:
+        ida_kernwin.warning("f00ddec: no function at 0x%X (press 'P')." % (ea if ea is not None else 0))
         return
+
     try:
-        fn = ida_bridge.decompile_one(ea)
+        fn = ida_bridge.decompile_one(start_ea)
     except Exception:
         ida_kernwin.warning("f00ddec failed:\n\n%s" % traceback.format_exc())
         return
     v = view.show(fn)
-    if v is not None:
+    if v is not None and v not in _views:
         _views.append(v)
     print("f00ddec: %s -> %d blocks" % (fn.name, len(fn.cfg.blocks)))
 
@@ -89,30 +113,73 @@ def _run_all():
         except Exception as exc:
             ida_kernwin.warning("f00ddec: could not write %s:\n%s" % (path, exc))
     v = view.show_listing("f00ddec - all functions", lines)
-    if v is not None:
+    if v is not None and v not in _views:
         _views.append(v)
 
 
+def _register_actions():
+    ida_kernwin.unregister_action(ACTION_DECOMPILE)
+    desc = ida_kernwin.action_desc_t(
+        ACTION_DECOMPILE,
+        "F00D Pseudocode",
+        _DecompileActionHandler(),
+        HOTKEY_DECOMPILE,
+        "Decompile current F00D function to pseudocode (F5)",
+        -1
+    )
+    if ida_kernwin.register_action(desc):
+        ida_kernwin.attach_action_to_menu(MENU_PSEUDOCODE_PATH, ACTION_DECOMPILE, ida_kernwin.SETMENU_APP)
+        ida_kernwin.attach_action_to_menu(MENU_PLUGIN_PATH, ACTION_DECOMPILE, ida_kernwin.SETMENU_APP)
+
+
+def _unregister_actions():
+    try:
+        ida_kernwin.detach_action_from_menu(MENU_PSEUDOCODE_PATH, ACTION_DECOMPILE)
+    except Exception:
+        pass
+    try:
+        ida_kernwin.detach_action_from_menu(MENU_PLUGIN_PATH, ACTION_DECOMPILE)
+    except Exception:
+        pass
+    try:
+        ida_kernwin.unregister_action(ACTION_DECOMPILE)
+    except Exception:
+        pass
+
+
 class F00dDecPlugin(ida_idaapi.plugin_t):
-    flags = 0
-    comment = "PS Vita F00D (Toshiba MeP) decompiler: lifter + structuring + pseudo-C"
-    help = "%s decompiles the current function, %s decompiles everything." % (HOTKEY_ONE, HOTKEY_ALL)
+    flags = ida_idaapi.PLUGIN_PROC
+    comment = "This is a decompilation plugin."
+    help = "%s decompiles the current function, %s decompiles everything." % (HOTKEY_DECOMPILE, HOTKEY_ALL)
     wanted_name = "F00D decompiler (f00ddec)"
-    wanted_hotkey = HOTKEY_ONE
+    wanted_hotkey = HOTKEY_DECOMPILE
 
     def init(self):
         if not _is_mep():
             return ida_idaapi.PLUGIN_SKIP
-        ctx = ida_kernwin.add_hotkey(HOTKEY_ALL, _run_all)
-        if ctx is not None:
-            _hotkeys.append(ctx)
-        print("f00ddec: loaded -- %s = this function, %s = decompile all" % (HOTKEY_ONE, HOTKEY_ALL))
+
+        _register_actions()
+
+        for hk, fn in [(HOTKEY_DECOMPILE, _run_one),
+                       (HOTKEY_LEGACY, _run_one),
+                       (HOTKEY_ALL, _run_all)]:
+            ctx = ida_kernwin.add_hotkey(hk, fn)
+            if ctx is not None:
+                _hotkeys.append(ctx)
+
+        print("f00ddec: loaded -- %s = this function, %s = decompile all" % (HOTKEY_DECOMPILE, HOTKEY_ALL))
+        try:
+            from f00ddec import view
+            view.init_hooks()
+        except Exception:
+            pass
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
         _run_one()
 
     def term(self):
+        _unregister_actions()
         try:
             from f00ddec import view
             view.cleanup()

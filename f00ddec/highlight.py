@@ -15,6 +15,7 @@ INTRINSICS = frozenset(("control_bus_load", "control_bus_store", "sra", "abs",
 
 _TOK = re.compile(r"""
       (?P<comment>/\*.*?\*/|//.*)
+    | (?P<string>"(?:[^"\\]|\\.)*")
     | (?P<hex>-?\b0[xX][0-9A-Fa-f]+)
     | (?P<num>-?\b\d+\b)
     | (?P<ident>[A-Za-z_$][A-Za-z_0-9$]*)
@@ -29,15 +30,16 @@ def _tag(t, c):
     return ida_lines.COLSTR(t, c)
 
 
-def colorize(line):
+def colorize(line, highlight_ident=None):
     if not line:
         return line
     st = line.lstrip()
-    if st.startswith(("//", "/*", "*", "*/")):
+    if st.startswith(("//", "/*", "*", "*/")) and not highlight_ident:
         return _tag(line, ida_lines.SCOLOR_AUTOCMT)
-    if _LABEL.match(st):
+    if _LABEL.match(st) and not highlight_ident:
         return _tag(line, ida_lines.SCOLOR_CREFTAIL)
     out, pos, n = [], 0, len(line)
+    extra_col = getattr(ida_lines, "SCOLOR_EXTRA", getattr(ida_lines, "SCOLOR_ERROR", "\x01\x32"))
     while pos < n:
         m = _TOK.match(line, pos)
         if not m:
@@ -47,10 +49,15 @@ def colorize(line):
             out.append(t)
         elif k == "comment":
             out.append(_tag(t, ida_lines.SCOLOR_AUTOCMT))
+        elif k == "string":
+            out.append(_tag(t, getattr(ida_lines, "SCOLOR_STRING", ida_lines.SCOLOR_SYMBOL)))
         elif k in ("hex", "num"):
             out.append(_tag(t, ida_lines.SCOLOR_NUMBER))
         elif k == "ident":
-            out.append(_tag(t, _ic(t, line, pos)))
+            if highlight_ident and t == highlight_ident:
+                out.append(_tag(t, extra_col))
+            else:
+                out.append(_tag(t, _ic(t, line, pos)))
         else:
             out.append(_tag(t, ida_lines.SCOLOR_SYMBOL))
     return "".join(out)

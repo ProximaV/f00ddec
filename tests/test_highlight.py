@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def _stub():
     il = types.ModuleType("ida_lines")
     il.COLSTR = lambda t, c: "<%s>%s</%s>" % (c, t, c)
-    for n in ("AUTOCMT", "NUMBER", "KEYWORD", "TYPE", "CREFTAIL", "CNAME", "REG", "SYMBOL"):
+    for n in ("AUTOCMT", "NUMBER", "KEYWORD", "TYPE", "CREFTAIL", "CNAME", "REG", "SYMBOL", "EXTRA", "STRING", "ERROR"):
         setattr(il, "SCOLOR_" + n, n.lower())
     sys.modules["ida_lines"] = il
 
@@ -27,6 +27,10 @@ def test_highlight():
     assert "<reg>r5</reg>" in H.colorize("    r5 = r0;")
     assert H.colorize("loc_10:").startswith("<creftail>")
     assert len(H.colorize_all(["void f(void)", "{", "}"])) == 3
+
+    # Token occurrence highlighting
+    hl = H.colorize("    r5 = r5 + 1;", highlight_ident="r5")
+    assert "<extra>r5</extra>" in hl
     print("ok  test_highlight")
 
 
