@@ -32,7 +32,7 @@ def _fold(e):
     if isinstance(e, ir.Un):
         return ir.Un(e.op, _fold(e.e))
     if isinstance(e, ir.Mem):
-        return ir.Mem(_fold(e.addr) if isinstance(e.addr, ir.Expr) else e.addr, e.width, e.signed)
+        return ir.Mem(_fold(e.addr) if isinstance(e.addr, ir.Expr) else e.addr, e.width, e.signed, getattr(e, 'name', None))
     if isinstance(e, ir.IntrExpr):
         return ir.IntrExpr(e.name, [_fold(a) for a in e.args])
     return e
@@ -80,7 +80,7 @@ def _subst(e, env):
     if isinstance(e, ir.Un):
         return ir.Un(e.op, _subst(e.e, env))
     if isinstance(e, ir.Mem):
-        return ir.Mem(_subst(e.addr, env) if isinstance(e.addr, ir.Expr) else e.addr, e.width, e.signed)
+        return ir.Mem(_subst(e.addr, env) if isinstance(e.addr, ir.Expr) else e.addr, e.width, e.signed, getattr(e, 'name', None))
     if isinstance(e, ir.IntrExpr):
         return ir.IntrExpr(e.name, [_subst(a, env) for a in e.args])
     return e

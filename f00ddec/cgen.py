@@ -1,10 +1,11 @@
 """
 Pseudo-C back-end for the MeP/F00D decompiler.
 
-Registers print as themselves or virtual variables (v0, v1, a0, ...); memory reads
-as ``mem8/mem16/mem32`` (``s8``/``s16`` for sign-extending loads) indexed by an
-address expression or symbolic name; conditional branches use the relational expression
-the lifter recovered. Out-of-function tail jumps render as ``JUMPOUT(addr)``.
+Registers print as themselves or virtual variables (v0, v1, a0, ...); memory
+reads and writes use Hex-Rays style pointer dereferences (*(_DWORD *), *(_WORD *),
+*(_BYTE *), *(char *)) or symbolic global names; conditional branches use the
+relational expression the lifter recovered. Out-of-function tail jumps render
+as ``JUMPOUT(addr)``.
 """
 
 from . import ir
@@ -66,13 +67,86 @@ class _Emit:
         return "?"
 
     def _mem(self, e):
+        # 1. Direct symbolic name on the Mem object
         if getattr(e, "name", None):
             return self.user_renames.get(e.name, e.name)
-        pre = {1: "s8" if e.signed else "mem8", 2: "s16" if e.signed else "mem16",
-               4: "mem32"}.get(e.width, "mem32")
+
+        # 2. Check if address is a constant with a known symbolic name in IDA / namer
+        addr_val = None
+        if isinstance(e.addr, ir.Const):
+            if getattr(e.addr, "name", None):
+                return self.user_renames.get(e.addr.name, e.addr.name)
+            addr_val = e.addr.value
+        elif isinstance(e.addr, int):
+            addr_val = e.addr
+
+        if addr_val is not None:
+            sym = None
+            if hasattr(self.namer, "data"):
+                sym = self.namer.data(addr_val)
+            elif hasattr(self.namer, "code_names"):
+                sym = self.namer.code_names.get(addr_val)
+            if sym and not sym.startswith(("sub_", "loc_")):
+                return self.user_renames.get(sym, sym)
+
+        # 3. Check if address is a base named symbol + offset or index
+        if isinstance(e.addr, ir.Bin) and e.addr.op == "+":
+            if isinstance(e.addr.l, ir.Const) and getattr(e.addr.l, "name", None):
+                base_name = self.user_renames.get(e.addr.l.name, e.addr.l.name)
+                return "%s[%s]" % (base_name, self.expr(e.addr.r))
+            elif isinstance(e.addr.r, ir.Const) and getattr(e.addr.r, "name", None):
+                base_name = self.user_renames.get(e.addr.r.name, e.addr.r.name)
+                return "%s[%s]" % (base_name, self.expr(e.addr.l))
+
+        # 4. Check if address is a typed pointer variable (*ptr)
+        if isinstance(e.addr, (ir.Reg, ir.Var)):
+            vname = e.addr.name
+            vtype = self.user_types.get(vname, "")
+            if vtype.endswith("*"):
+                base_t = vtype[:-1].strip()
+                t_size = 4 if base_t in ("int", "_DWORD", "uint32_t", "int32_t", "unsigned int") else (
+                         2 if base_t in ("short", "_WORD", "uint16_t", "int16_t", "unsigned short") else (
+                         1 if base_t in ("char", "_BYTE", "uint8_t", "int8_t", "unsigned char") else None))
+                if t_size is None or t_size == e.width:
+                    eff_name = self.user_renames.get(vname, vname)
+                    return "*%s" % eff_name
+
+        # 5. Check if address is ptr + offset for a typed pointer (ptr[idx])
+        if isinstance(e.addr, ir.Bin) and e.addr.op == "+":
+            if isinstance(e.addr.l, (ir.Reg, ir.Var)) and isinstance(e.addr.r, (ir.Const, int)):
+                vname = e.addr.l.name
+                offset_val = e.addr.r.value if isinstance(e.addr.r, ir.Const) else e.addr.r
+                vtype = self.user_types.get(vname, "")
+                if vtype.endswith("*"):
+                    base_t = vtype[:-1].strip()
+                    t_size = 4 if base_t in ("int", "_DWORD", "uint32_t", "int32_t", "unsigned int") else (
+                             2 if base_t in ("short", "_WORD", "uint16_t", "int16_t", "unsigned short") else (
+                             1 if base_t in ("char", "_BYTE", "uint8_t", "int8_t", "unsigned char") else None))
+                    if t_size and e.width == t_size and offset_val % t_size == 0:
+                        eff_name = self.user_renames.get(vname, vname)
+                        idx = offset_val // t_size
+                        return "%s[%d]" % (eff_name, idx)
+
+        # 6. Default Hex-Rays cast dereference
+        if e.width == 4:
+            cast = "_DWORD *"
+        elif e.width == 2:
+            cast = "short *" if e.signed else "_WORD *"
+        elif e.width == 1:
+            cast = "char *" if e.signed else "_BYTE *"
+        else:
+            cast = "_DWORD *"
+
         if isinstance(e.addr, ir.Expr):
-            return "%s[%s]" % (pre, self.expr(e.addr))
-        return "%s[0x%X]" % (pre, e.addr)
+            addr_str = self.expr(e.addr, top=False)
+            if addr_str.startswith("(") and addr_str.endswith(")"):
+                return "*(%s)%s" % (cast, addr_str)
+            elif " " in addr_str:
+                return "*(%s)(%s)" % (cast, addr_str)
+            else:
+                return "*(%s)%s" % (cast, addr_str)
+        else:
+            return "*(%s)0x%X" % (cast, e.addr)
 
     def stmt(self, s):
         if isinstance(s, ir.Assign):

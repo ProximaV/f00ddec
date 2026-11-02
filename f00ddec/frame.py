@@ -149,7 +149,7 @@ def rewrite(func):
                 if off is not None and off not in saved:
                     return ir.Reg(slot_name(off, e.width))
                 addr = xf(e.addr) if isinstance(e.addr, ir.Expr) else e.addr
-                return ir.Mem(addr, e.width, e.signed)
+                return ir.Mem(addr, e.width, e.signed, getattr(e, 'name', None))
             if isinstance(e, ir.Bin):
                 off = _canon_off(_sp_off(e), cur_delta, frame_size)
                 if off is not None and off not in saved:
@@ -216,7 +216,7 @@ def rewrite(func):
                         s.dst = ir.Reg(slot_name(off, s.dst.width))
                     else:
                         s.dst = ir.Mem(xf(s.dst.addr) if isinstance(s.dst.addr, ir.Expr) else s.dst.addr,
-                                       s.dst.width, s.dst.signed)
+                                       s.dst.width, s.dst.signed, getattr(s.dst, 'name', None))
             elif isinstance(s, ir.Branch):
                 s.cexpr = xf(s.cexpr)
             elif isinstance(s, ir.Switch):

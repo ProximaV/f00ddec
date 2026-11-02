@@ -18,9 +18,9 @@ __version__ = "0.2.0"
 BANNER = [
     "/*",
     " * Decompiled by f00ddec -- PS Vita F00D (Toshiba MeP, little-endian).",
-    " * r0..r12/tp/gp/sp are the machine registers; mem8/mem16/mem32 index data",
-    " * memory (s8/s16 = sign-extending loads).  Unmodelled opcodes are printed",
-    " * as pseudo-calls; cross-function tail jumps as JUMPOUT().",
+    " * r0..r12/tp/gp/sp are machine registers; *(_DWORD*), *(_WORD*), *(_BYTE*)",
+    " * dereference memory.  Unmodelled opcodes are printed as pseudo-calls;",
+    " * cross-function tail jumps as JUMPOUT().",
     " */",
     "",
 ]
@@ -97,4 +97,3 @@ def decompile_file(path, base=None, extra_entries=(), **kw):
 def decompile_one(ea):
     from . import ida_bridge
     return ida_bridge.decompile_one(ea)
-
