@@ -31,22 +31,173 @@ class CodeLines(list):
     pass
 
 
+def format_c_string(s):
+    """Format string content as a standard C escaped double-quoted string literal."""
+    if isinstance(s, bytes):
+        try:
+            s = s.decode("latin-1")
+        except Exception:
+            s = str(s)
+    res = []
+    for ch in s:
+        if ch == '"':
+            res.append(r'\"')
+        elif ch == '\\':
+            res.append(r'\\')
+        elif ch == '\n':
+            res.append(r'\n')
+        elif ch == '\r':
+            res.append(r'\r')
+        elif ch == '\t':
+            res.append(r'\t')
+        elif ch == '\a':
+            res.append(r'\a')
+        elif ch == '\b':
+            res.append(r'\b')
+        elif ch == '\f':
+            res.append(r'\f')
+        elif ch == '\v':
+            res.append(r'\v')
+        elif 32 <= ord(ch) <= 126:
+            res.append(ch)
+        else:
+            res.append(r'\x%02X' % ord(ch))
+    return '"' + ''.join(res) + '"'
+
+
+def format_c_char(v):
+    """Format an integer as a standard C character literal."""
+    if 0 <= v <= 255:
+        ch = chr(v)
+        if ch == "'":
+            return r"'\''"
+        elif ch == '\\':
+            return r"'\\'"
+        elif ch == '\n':
+            return r"'\n'"
+        elif ch == '\t':
+            return r"'\t'"
+        elif ch == '\r':
+            return r"'\r'"
+        elif ch == '\a':
+            return r"'\a'"
+        elif ch == '\b':
+            return r"'\b'"
+        elif 32 <= v <= 126:
+            return f"'{ch}'"
+        else:
+            return r"'\x%02X'" % v
+    chars = []
+    temp = v
+    while temp > 0:
+        b = temp & 0xFF
+        if 32 <= b <= 126 and chr(b) not in ("'", "\\"):
+            chars.append(chr(b))
+        else:
+            return "0x%X" % v
+        temp >>= 8
+    return "'" + "".join(chars) + "'"
+
+
 class _Emit:
-    def __init__(self, namer, block_starts=frozenset(), returns_value=False, hidden=frozenset(), user_renames=None, user_types=None):
+    def __init__(self, namer, block_starts=frozenset(), returns_value=False, hidden=frozenset(),
+                 user_renames=None, user_types=None, user_numforms=None, user_iflags=None, show_casts=True):
         self.namer = namer
         self.block_starts = block_starts
         self.returns_value = returns_value
         self.hidden = hidden
         self.user_renames = user_renames or {}
         self.user_types = user_types or {}
+        self.user_numforms = user_numforms or {}
+        self.user_iflags = set(user_iflags or [])
+        self.show_casts = show_casts
+        self.cur_ea = None
         self.used_labels = set()
         self._pending = []
 
+    def _resolve_sym_name(self, v):
+        if hasattr(self.namer, "code"):
+            name = self.namer.code(v)
+            if name and not name.startswith("?"):
+                return name
+        if hasattr(self.namer, "data"):
+            name = self.namer.data(v)
+            if name:
+                return name
+        return None
+
+    def _invert_cond(self, cond):
+        if isinstance(cond, ir.Bin):
+            inv_map = {
+                "==": "!=", "!=": "==",
+                "<": ">=", ">=": "<",
+                ">": "<=", "<=": ">",
+                "u<": "u>=", "u>=": "u<",
+                "u>": "u<=", "u<=": "u>",
+            }
+            if cond.op in inv_map:
+                return ir.Bin(inv_map[cond.op], cond.l, cond.r)
+        if isinstance(cond, ir.Un) and cond.op == "!":
+            return cond.e
+        return ir.Un("!", cond)
+
     def expr(self, e, top=True):
         if isinstance(e, ir.Const):
+            v = e.value & 0xFFFFFFFF
+            # Check custom number format override
+            form = None
+            if self.user_numforms:
+                v_hex = hex(v)
+                v_hex_lower = v_hex.lower()
+                if self.cur_ea is not None:
+                    ea_hex = hex(self.cur_ea)
+                    ea_hex_lower = ea_hex.lower()
+                    form = (self.user_numforms.get(f"{ea_hex}:{v_hex}")
+                            or self.user_numforms.get(f"{ea_hex_lower}:{v_hex_lower}")
+                            or self.user_numforms.get(f"{ea_hex}:{v}")
+                            or self.user_numforms.get(f"{self.cur_ea}:{v_hex}")
+                            or self.user_numforms.get(f"{self.cur_ea}:{v_hex_lower}")
+                            or self.user_numforms.get(f"{self.cur_ea}:{v}")
+                            or self.user_numforms.get((self.cur_ea, v_hex))
+                            or self.user_numforms.get((self.cur_ea, v_hex_lower))
+                            or self.user_numforms.get((self.cur_ea, v))
+                            or self.user_numforms.get((ea_hex, v_hex))
+                            or self.user_numforms.get((ea_hex_lower, v_hex_lower)))
+                if not form:
+                    form = (self.user_numforms.get(v_hex)
+                            or self.user_numforms.get(v_hex_lower)
+                            or self.user_numforms.get(str(v))
+                            or self.user_numforms.get(v))
+
+            if form:
+                if form == "hex":
+                    return "0x%X" % v
+                elif form == "dec":
+                    signed = (v - 0x100000000) if v >= 0x80000000 else v
+                    return str(signed)
+                elif form == "char":
+                    return format_c_char(v)
+                elif form in ("offset", "sym"):
+                    sym = self._resolve_sym_name(v)
+                    if sym:
+                        return sym
+                elif form == "invsign":
+                    signed = (v - 0x100000000) if v >= 0x80000000 else v
+                    return str(signed)
+                elif form == "bnot":
+                    inv = (~v) & 0xFFFFFFFF
+                    return ("~0x%X" % inv) if inv >= 10 else f"~{inv}"
+
+            if getattr(e, "name", None) and e.name in self.user_renames:
+                return self.user_renames[e.name]
+            if hasattr(self.namer, "string"):
+                s = self.namer.string(e.value)
+                if s is None and getattr(e, "name", None):
+                    s = self.namer.string(e.name)
+                if s is not None:
+                    return format_c_string(s)
             if getattr(e, "name", None):
                 return self.user_renames.get(e.name, e.name)
-            v = e.value
             return str(v) if v < 10 else "0x%X" % v
         if isinstance(e, (ir.Reg, ir.Var)):
             return self.user_renames.get(e.name, e.name)
@@ -128,7 +279,9 @@ class _Emit:
                         return "%s[%d]" % (eff_name, idx)
 
         # 6. Default Hex-Rays cast dereference
-        if e.width == 4:
+        if not self.show_casts:
+            cast = ""
+        elif e.width == 4:
             cast = "_DWORD *"
         elif e.width == 2:
             cast = "short *" if e.signed else "_WORD *"
@@ -139,6 +292,8 @@ class _Emit:
 
         if isinstance(e.addr, ir.Expr):
             addr_str = self.expr(e.addr, top=False)
+            if not self.show_casts:
+                return "*%s" % (("(%s)" % addr_str) if " " in addr_str else addr_str)
             if addr_str.startswith("(") and addr_str.endswith(")"):
                 return "*(%s)%s" % (cast, addr_str)
             elif " " in addr_str:
@@ -146,9 +301,12 @@ class _Emit:
             else:
                 return "*(%s)%s" % (cast, addr_str)
         else:
+            if not self.show_casts:
+                return "*0x%X" % e.addr
             return "*(%s)0x%X" % (cast, e.addr)
 
     def stmt(self, s):
+        self.cur_ea = getattr(s, "ea", None)
         if isinstance(s, ir.Assign):
             return "%s = %s;" % (self.expr(s.dst), self.expr(s.src))
         if isinstance(s, ir.Call):
@@ -220,11 +378,25 @@ class _Emit:
                     self._pending.append((ind, pad + "if (%s) continue;" % self.expr(n.cond), None, ea, all_eas))
             elif isinstance(n, S.SIf):
                 ea = getattr(n, "ea", None)
-                self._pending.append((ind, pad + "if (%s) {" % self.expr(n.cond), None, ea, [ea] if ea is not None else []))
-                self.emit(n.then, ind + 1)
-                if n.els:
+                inverted = False
+                if ea is not None and (ea in self.user_iflags or hex(ea) in self.user_iflags or str(ea) in self.user_iflags):
+                    inverted = True
+
+                cond_expr = n.cond
+                then_body = n.then
+                els_body = n.els
+
+                if inverted:
+                    cond_expr = self._invert_cond(cond_expr)
+                    if els_body:
+                        then_body, els_body = els_body, then_body
+
+                self.cur_ea = ea
+                self._pending.append((ind, pad + "if (%s) {" % self.expr(cond_expr), None, ea, [ea] if ea is not None else []))
+                self.emit(then_body, ind + 1)
+                if els_body:
                     self._pending.append((ind, pad + "} else {", None, None, []))
-                    self.emit(n.els, ind + 1)
+                    self.emit(els_body, ind + 1)
                 self._pending.append((ind, pad + "}", None, None, []))
             elif isinstance(n, S.SWhile):
                 self._emit_while(n, ind)
@@ -302,7 +474,9 @@ class _Emit:
         return out, line_eas, line_to_eas
 
 
-def generate(func, tree, namer, frame_info=None, sig=None, banner=None, user_renames=None, user_types=None):
+def generate(func, tree, namer, frame_info=None, sig=None, banner=None,
+             user_renames=None, user_types=None, user_comments=None,
+             user_numforms=None, user_iflags=None, show_casts=True):
     hidden = getattr(frame_info, "hidden_stmts", frozenset()) if frame_info else frozenset()
     u_renames = dict(getattr(frame_info, "user_renames", {}) or {})
     if user_renames:
@@ -313,9 +487,22 @@ def generate(func, tree, namer, frame_info=None, sig=None, banner=None, user_ren
 
     returns_value = (sig.ret_type != "void") if sig else False
     em = _Emit(namer, block_starts=frozenset(func.blocks), returns_value=returns_value,
-               hidden=hidden, user_renames=u_renames, user_types=u_types)
+               hidden=hidden, user_renames=u_renames, user_types=u_types,
+               user_numforms=user_numforms, user_iflags=user_iflags, show_casts=show_casts)
     em.emit(tree, 1)
     body, body_eas, body_line_to_eas = em.flush()
+
+    if user_comments:
+        for idx in range(len(body)):
+            line_eas = body_line_to_eas.get(idx, [])
+            for lea in line_eas:
+                ea_key = hex(lea) if isinstance(lea, int) else str(lea)
+                cmt = (user_comments.get(ea_key)
+                       or user_comments.get(str(lea))
+                       or (user_comments.get(lea) if isinstance(lea, int) else None))
+                if cmt:
+                    body[idx] = f"{body[idx]}  // {cmt}"
+                    break
 
     out = CodeLines()
     if banner:

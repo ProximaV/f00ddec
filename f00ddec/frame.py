@@ -231,13 +231,14 @@ def rewrite(func):
 
 
 class FrameInfo:
-    def __init__(self, locals=None, stack_args=None, hidden_stmts=None, virtual_vars=None, user_renames=None, user_types=None):
+    def __init__(self, locals=None, stack_args=None, hidden_stmts=None, virtual_vars=None, user_renames=None, user_types=None, ida_stkvars=None):
         self.locals = locals or {}
         self.stack_args = stack_args or {}
         self.hidden_stmts = hidden_stmts or set()
         self.virtual_vars = virtual_vars or {}
         self.user_renames = user_renames or {}
         self.user_types = user_types or {}
+        self.ida_stkvars = ida_stkvars or {}
 
 
 def analyze_frame(func, ida_frame_info=None):
@@ -261,7 +262,8 @@ def analyze_frame(func, ida_frame_info=None):
                 if arg_name in stack_args or not arg_name.startswith("arg_"):
                     stack_args[arg_name] = max(stack_args.get(arg_name, 1), size)
 
-    return FrameInfo(locals=locals_dict, stack_args=stack_args)
+    return FrameInfo(locals=locals_dict, stack_args=stack_args,
+                     ida_stkvars=getattr(ida_frame_info, "stkvars_by_ea", None))
 
 
 def local_decls(func):

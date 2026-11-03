@@ -222,7 +222,7 @@ def _infer_return_type(func, hidden_stmts=frozenset(), ret_types=None):
     return ("int *" if r0_is_pointer else "int"), ir.Reg("r0")
 
 
-def analyze_calling_convention(func, frame_info=None, user_proto=None, func_name=None, ret_types=None):
+def analyze_calling_convention(func, frame_info=None, user_proto=None, func_name=None, ret_types=None, caller_consensus=None):
     """Recover function signature (parameters, return type) for func."""
     hidden = getattr(frame_info, "hidden_stmts", frozenset()) or frozenset()
     name = func_name or ("sub_%X" % func.entry)
@@ -234,7 +234,13 @@ def analyze_calling_convention(func, frame_info=None, user_proto=None, func_name
             return sig
 
     # 2. Compute live-in argument registers
-    live_in = compute_liveness(func, hidden)
+    live_in = set(compute_liveness(func, hidden))
+
+    # Apply caller consensus ground truth if available
+    if caller_consensus:
+        for rname, has_arg in caller_consensus.items():
+            if has_arg:
+                live_in.add(rname)
 
     # In C calling convention, find highest argument register index
     max_arg_idx = -1

@@ -13,8 +13,12 @@ from . import Program, Function, BANNER  # noqa: F401
 class IdaNamer(Namer):
     def __init__(self):
         super().__init__()
-        import ida_name
+        import ida_name, ida_bytes, ida_nalt, ida_segment
         self._n = ida_name
+        self._b = ida_bytes
+        self._nalt = ida_nalt
+        self._seg = ida_segment
+        self._str_cache = {}
 
     def code(self, ea):
         if ea is None:
@@ -26,6 +30,48 @@ class IdaNamer(Namer):
 
     def data(self, ea):
         return self._n.get_name(ea) or super().data(ea)
+
+    def string(self, key):
+        if key is None:
+            return None
+        if key in self._str_cache:
+            return self._str_cache[key]
+        ea = key
+        if isinstance(key, str):
+            try:
+                ea = self._n.get_name_ea(0, key)
+                if ea == 0xFFFFFFFF or ea == 0xFFFFFFFFFFFFFFFF:
+                    return None
+            except Exception:
+                return None
+        val = self._lookup_string(ea)
+        self._str_cache[key] = val
+        return val
+
+    def _lookup_string(self, ea):
+        try:
+            if not isinstance(ea, int) or ea < 0x1000:
+                return None
+            flags = self._b.get_flags(ea)
+            is_str = self._b.is_strlit(flags)
+            name = self._n.get_name(ea) or ""
+            seg = self._seg.getseg(ea)
+            if not seg:
+                return None
+            if seg.type == self._seg.SEG_CODE and not is_str:
+                return None
+
+            if is_str or name.startswith(("a", "asc_")):
+                raw = self._b.get_strlit_contents(ea, -1, self._nalt.STRTYPE_C)
+                if raw and all(32 <= b <= 126 or b in (9, 10, 13) for b in raw):
+                    return raw.decode("latin-1")
+            elif seg.type != self._seg.SEG_CODE and not name.startswith(("sub_", "loc_")):
+                raw = self._b.get_strlit_contents(ea, 256, self._nalt.STRTYPE_C)
+                if raw and len(raw) >= 2 and all(32 <= b <= 126 or b in (9, 10, 13) for b in raw):
+                    return raw.decode("latin-1")
+        except Exception:
+            pass
+        return None
 
 
 class SegmentedImage:
@@ -97,23 +143,43 @@ def _entries():
     return sorted(idautils.Functions())
 
 
-def _resolve_op_name(ea, n, op):
-    """Resolve an instruction operand to a named symbol in IDA."""
+def _resolve_op_name(ea, n, op=None):
+    """Resolve an instruction operand to a named symbol in IDA using structured native instruction decoding."""
     try:
-        import idautils, ida_name, ida_idaapi
-        # 1. Check data cross references from this instruction
+        import ida_ua, ida_name, ida_bytes, ida_idaapi, idautils
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, ea) > 0 and n < len(insn.ops):
+            ida_op = insn.ops[n]
+            if ida_op.type != ida_ua.o_void:
+                # 1. Direct memory or code target
+                if ida_op.type in (ida_ua.o_mem, ida_ua.o_near):
+                    target_ea = ida_op.addr
+                    name = ida_name.get_name(target_ea)
+                    if name and not name.startswith(("unk_", "byte_", "word_", "dword_", "loc_", "sub_")):
+                        return name
+                # 2. Immediate operand marked as offset or referencing mapped address
+                elif ida_op.type == ida_ua.o_imm:
+                    flags = ida_bytes.get_flags(ea)
+                    val = ida_op.value & 0xFFFFFFFF
+                    if ida_bytes.is_off(flags, n) or (0x1000 <= val < 0xFFFFFFFF):
+                        name = ida_name.get_name(val)
+                        if name and not name.startswith(("unk_", "byte_", "word_", "dword_", "loc_", "sub_")):
+                            return name
+
+        # 3. Data cross references from this instruction
         for x in idautils.XrefsFrom(ea):
             if not x.iscode:
                 xname = ida_name.get_name(x.to)
                 if xname and not xname.startswith(("unk_", "byte_", "word_", "dword_", "loc_", "sub_")):
                     return xname
 
-        # 2. Check address directly if it's a valid mapped address pointing to a named symbol
-        val = getattr(op, "value", None) or getattr(op, "addr", None)
-        if val is not None and isinstance(val, int) and (val >= 0x800000 or val >= 0x1000):
-            val_name = ida_name.get_name(val)
-            if val_name and not val_name.startswith(("unk_", "byte_", "word_", "dword_", "loc_", "sub_")):
-                return val_name
+        # 4. Fallback to decoder op value if provided
+        if op is not None:
+            val = getattr(op, "value", None) or getattr(op, "addr", None)
+            if val is not None and isinstance(val, int) and (val >= 0x800000 or val >= 0x1000):
+                val_name = ida_name.get_name(val)
+                if val_name and not val_name.startswith(("unk_", "byte_", "word_", "dword_", "loc_", "sub_")):
+                    return val_name
     except Exception:
         pass
     return None
@@ -130,14 +196,16 @@ def _annotate_operand_names(insns):
 
 
 class _IdaFrameInfo:
-    def __init__(self, members=None):
+    def __init__(self, members=None, stkvars_by_ea=None):
         self.members = members or {}
+        self.stkvars_by_ea = stkvars_by_ea or {}
 
 
 def _ida_frame_info(ea):
-    """Read stack frame structure details from IDA Pro if available."""
+    """Read stack frame structure details and stack variable operands from IDA Pro using native API."""
     try:
-        import ida_funcs, ida_frame, ida_typeinf
+        import ida_funcs, ida_frame, ida_typeinf, ida_ua
+        from ida_idaapi import BADADDR
         pfn = ida_funcs.get_func(ea)
         if not pfn:
             return None
@@ -150,7 +218,33 @@ def _ida_frame_info(ea):
                 for m in udt:
                     actual_off = (m.offset // 8) - frsize
                     members[actual_off] = (m.name, m.size // 8, m.type.dstr())
-        return _IdaFrameInfo(members=members)
+
+        off_args = ida_frame.frame_off_args(pfn)
+        stkvars_by_ea = {}
+        cur = pfn.start_ea
+        insn = ida_ua.insn_t()
+        while cur < pfn.end_ea:
+            if ida_ua.decode_insn(insn, cur) > 0:
+                for n in range(6):
+                    op = insn.ops[n]
+                    if op.type == ida_ua.o_void:
+                        break
+                    soff = ida_frame.calc_stkvar_struc_offset(pfn, insn, n)
+                    if soff != BADADDR and soff is not None:
+                        if soff >= (1 << 63):
+                            soff -= (1 << 64)
+                        m = members.get(soff)
+                        name = m[0] if m else ida_frame.build_stkvar_name(pfn, soff)
+                        size = m[1] if m else 4
+                        if soff < 0:
+                            is_arg = False
+                            if name.startswith("arg_"):
+                                name = "var_%X" % abs(soff)
+                        else:
+                            is_arg = (soff >= off_args) if off_args != BADADDR else name.startswith("arg_")
+                        stkvars_by_ea.setdefault(cur, {})[n] = (soff, name, size, is_arg)
+            cur += insn.size if insn.size > 0 else 2
+        return _IdaFrameInfo(members=members, stkvars_by_ea=stkvars_by_ea)
     except Exception:
         return None
 
@@ -168,10 +262,85 @@ def _get_ida_func_proto(ea):
     return None
 
 
+def _get_caller_consensus(entry):
+    """Infer whether callers set parameter registers (r1..r4) before calling entry using structured IDA instruction decoding."""
+    try:
+        import idautils, ida_ua, ida_idp, ida_bytes, ida_idaapi
+        caller_eas = list(idautils.CodeRefsTo(entry, 0))
+        if not caller_eas:
+            return None
+        counts = {1: 0, 2: 0, 3: 0, 4: 0}
+        valid = 0
+        insn = ida_ua.insn_t()
+        for c in caller_eas:
+            cur = c
+            found = set()
+            count = 0
+            while cur != ida_idaapi.BADADDR and cur >= c - 32 and count < 8:
+                cur = ida_bytes.prev_head(cur, 0)
+                if cur == ida_idaapi.BADADDR:
+                    break
+                if ida_ua.decode_insn(insn, cur) == 0:
+                    break
+                mnem = insn.get_canon_mnem().lower()
+                count += 1
+                if mnem in ("ret", "reti", "dret", "jmp", "bra") and cur != c:
+                    break
+                # Check destination operand if it writes to $1..$4 (r1..r4)
+                if insn.ops[0].type == ida_ua.o_reg:
+                    rname = ida_idp.get_reg_name(insn.ops[0].reg, insn.ops[0].dtype).lower().lstrip("$r")
+                    try:
+                        regnum = int(rname)
+                        if 1 <= regnum <= 4 and regnum not in found:
+                            found.add(regnum)
+                    except ValueError:
+                        pass
+                if mnem in ("bsr", "jsr"):
+                    break
+            valid += 1
+            for regnum in found:
+                counts[regnum] += 1
+        if valid == 0:
+            return None
+        res = {}
+        for r in range(1, 5):
+            if (counts[r] / valid) >= 0.75:
+                res[f"r{r}"] = True
+        return res if res else None
+    except Exception:
+        return None
+
+
 def _find_entry(image, base, ea, entset):
-    """If *ea* is inside an un-functioned routine in IDA, locate its entry."""
+    """If *ea* is inside an un-functioned routine in IDA, locate its entry using native IDA instruction boundaries."""
     if ea in entset:
         return ea
+    try:
+        import ida_bytes, ida_ua, ida_idaapi
+        cur = ea
+        insn = ida_ua.insn_t()
+        limit = max(base, cur - 0x200)
+        while cur > limit:
+            prev = ida_bytes.prev_head(cur, base)
+            if prev == ida_idaapi.BADADDR:
+                break
+            if prev in entset:
+                return prev
+            if ida_ua.decode_insn(insn, prev) > 0:
+                mnem = insn.get_canon_mnem().lower()
+                if mnem in ("ret", "reti", "dret", "bra", "jmp"):
+                    return cur
+                if mnem == "nop":
+                    prev2 = ida_bytes.prev_head(prev, base)
+                    if prev2 != ida_idaapi.BADADDR and ida_ua.decode_insn(insn, prev2) > 0:
+                        if insn.get_canon_mnem().lower() in ("ret", "reti", "dret", "bra", "jmp"):
+                            return cur
+            cur = prev
+        if cur != ea:
+            return cur
+    except Exception:
+        pass
+
     cur = ea & ~1
     limit = max(base, cur - 0x200)
     best = cur
@@ -206,7 +375,8 @@ def _callee_arity(image, base, callee_ea, entset):
         return None
     frame_info = frame.analyze_frame(c_func)
     opt.optimize(c_func)
-    sig = abi.analyze_calling_convention(c_func, frame_info=frame_info)
+    cons = _get_caller_consensus(callee_ea)
+    sig = abi.analyze_calling_convention(c_func, frame_info=frame_info, caller_consensus=cons)
     n = len(sig.params)
     _ARITY_CACHE[callee_ea] = n
     _RET_CACHE[callee_ea] = sig.ret_type
@@ -227,7 +397,8 @@ def decompile_program():
     for entry, f in funcs.items():
         frame_info = frame.analyze_frame(f)
         opt.optimize(f)
-        sig = abi.analyze_calling_convention(f, frame_info=frame_info)
+        cons = _get_caller_consensus(entry)
+        sig = abi.analyze_calling_convention(f, frame_info=frame_info, caller_consensus=cons)
         _ARITY_CACHE[entry] = len(sig.params)
         _RET_CACHE[entry] = sig.ret_type
 
@@ -245,16 +416,23 @@ def decompile_program():
 
         callargs.rewrite(f, _ARITY_CACHE)
         opt.optimize(f)
-        sig = abi.analyze_calling_convention(f, frame_info=frame_info, user_proto=u_proto, ret_types=_RET_CACHE)
+        consensus = _get_caller_consensus(entry)
+        sig = abi.analyze_calling_convention(f, frame_info=frame_info, user_proto=u_proto,
+                                            ret_types=_RET_CACHE, caller_consensus=consensus)
         vars.recover_variables(f, sig, frame_info)
         tree = structure.structure(f)
+        u_comments = db_data.get("cmts", {})
+        u_numforms = db_data.get("numforms", {})
+        u_iflags = db_data.get("iflags", [])
         lines = cgen.generate(f, tree, namer, frame_info=frame_info, sig=sig,
-                              user_renames=u_renames, user_types=u_types)
+                              user_renames=u_renames, user_types=u_types,
+                              user_comments=u_comments, user_numforms=u_numforms,
+                              user_iflags=u_iflags)
         out[entry] = Function(entry, namer.code(entry), f, tree, lines)
     return Program(image, base, insns, out, namer)
 
 
-def decompile_one(ea):
+def decompile_one(ea, show_casts=True):
     import ida_funcs
     image, base = _image()
     if image is None:
@@ -285,6 +463,9 @@ def decompile_one(ea):
     u_renames = db_data.get("renames", {})
     u_types = db_data.get("types", {})
     u_proto = db_data.get("proto") or _get_ida_func_proto(entry)
+    u_comments = db_data.get("cmts", {})
+    u_numforms = db_data.get("numforms", {})
+    u_iflags = db_data.get("iflags", [])
 
     ida_info = _ida_frame_info(entry)
     frame_info = frame.analyze_frame(func, ida_frame_info=ida_info)
@@ -300,9 +481,13 @@ def decompile_one(ea):
     callargs.rewrite(func, arity)
 
     opt.optimize(func)
-    sig = abi.analyze_calling_convention(func, frame_info=frame_info, user_proto=u_proto, ret_types=_RET_CACHE)
+    consensus = _get_caller_consensus(entry)
+    sig = abi.analyze_calling_convention(func, frame_info=frame_info, user_proto=u_proto,
+                                        ret_types=_RET_CACHE, caller_consensus=consensus)
     vars.recover_variables(func, sig, frame_info)
     tree = structure.structure(func)
     lines = cgen.generate(func, tree, namer, frame_info=frame_info, sig=sig, banner=None,
-                          user_renames=u_renames, user_types=u_types)
+                          user_renames=u_renames, user_types=u_types,
+                          user_comments=u_comments, user_numforms=u_numforms,
+                          user_iflags=u_iflags, show_casts=show_casts)
     return Function(entry, namer.code(entry), func, tree, lines)

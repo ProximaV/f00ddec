@@ -33,6 +33,17 @@ ACTION_SET_TYPE = "f00ddec:set_type"
 ACTION_TOGGLE_SYNC = "f00ddec:toggle_sync"
 ACTION_JUMP_DISASM = "f00ddec:jump_disasm"
 ACTION_REFRESH = "f00ddec:refresh"
+ACTION_TOGGLE_HEX_DEC = "f00ddec:toggle_hex_dec"
+ACTION_CVT_OFFSET = "f00ddec:cvt_offset"
+ACTION_CVT_CHAR = "f00ddec:cvt_char"
+ACTION_INVERT_SIGN = "f00ddec:invert_sign"
+ACTION_BITWISE_NEGATE = "f00ddec:bitwise_negate"
+ACTION_EDIT_COMMENT = "f00ddec:edit_comment"
+ACTION_INVERT_IF = "f00ddec:invert_if"
+ACTION_TOGGLE_CASTS = "f00ddec:toggle_casts"
+ACTION_JUMP_XREF = "f00ddec:jump_xref"
+ACTION_JUMP_BRACE = "f00ddec:jump_brace"
+ACTION_RESET_ITEM = "f00ddec:reset_item"
 
 _active_viewer = None
 _ui_hooks = None
@@ -135,6 +146,7 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         self._highlighted_asm_eas = set()
         self._sync_lock = False
         self.sync_with_disasm = db.get_sync_enabled()
+        self.show_casts = True
         self._nav_history = []
         self._last_token = None
         self._highlighted_token_lines = set()
@@ -398,12 +410,318 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         pfn = ida_funcs.get_func(ea)
         entry = pfn.start_ea if pfn else ea
         try:
-            fn = ida_bridge.decompile_one(entry)
+            fn = ida_bridge.decompile_one(entry, show_casts=getattr(self, "show_casts", True))
             self.build_or_refresh(fn)
             return True
         except Exception as exc:
             print("f00ddec: decompilation failed for 0x%X: %s" % (entry, exc))
             return False
+
+    def get_literal_under_cursor(self):
+        """Return (literal_str, num_val, lineno, col, stmt_ea)."""
+        pos = self.GetPos()
+        if not pos:
+            return None, None, 0, 0, None
+        lineno, col = pos[0], pos[1]
+        if lineno < 0 or lineno >= len(self.raw_lines):
+            return None, None, lineno, col, None
+        line = self.raw_lines[lineno]
+        if not line:
+            return None, None, lineno, col, None
+        stmt_eas = self.line_to_eas.get(lineno, [])
+        stmt_ea = stmt_eas[0] if stmt_eas else (self.line_ea[lineno] if lineno < len(self.line_ea) else None)
+
+        num_pat = re.compile(r"0x[0-9a-fA-F]+|-?\b\d+\b|'[^']*'")
+        for m in num_pat.finditer(line):
+            start, end = m.span()
+            if start <= col <= end:
+                text = m.group(0)
+                val = None
+                try:
+                    if text.startswith(("0x", "0X")):
+                        val = int(text, 16)
+                    elif text.startswith("'") and text.endswith("'"):
+                        inner = text[1:-1]
+                        if len(inner) == 1:
+                            val = ord(inner)
+                        elif inner.startswith("\\x"):
+                            val = int(inner[2:], 16)
+                    else:
+                        val = int(text, 10)
+                except Exception:
+                    pass
+                return text, val, lineno, col, stmt_ea
+        return None, None, lineno, col, stmt_ea
+
+    def on_toggle_hex_dec(self):
+        """Toggle numeric constant between hex and decimal format (H)."""
+        if self.current_func_ea is None:
+            return
+        text, val, lineno, col, stmt_ea = self.get_literal_under_cursor()
+        if text is None or val is None:
+            return
+        pos = self.GetPos()
+        curr_form = db.get_numform(self.current_func_ea, stmt_ea or 0, hex(val))
+        if curr_form:
+            target_form = "dec" if curr_form == "hex" else "hex"
+        else:
+            target_form = "dec" if text.startswith(("0x", "0X")) else "hex"
+        db.set_numform(self.current_func_ea, stmt_ea or 0, hex(val), target_form)
+        self.show_func(self.current_func_ea)
+        if pos:
+            try:
+                self.Jump(pos[0], pos[1])
+            except Exception:
+                pass
+
+    def on_convert_offset(self):
+        """Convert numeric constant to offset / symbol reference (O)."""
+        if self.current_func_ea is None:
+            return
+        text, val, lineno, col, stmt_ea = self.get_literal_under_cursor()
+        if text is None or val is None:
+            word, lineno = self.get_word_under_cursor()
+            if word:
+                pos = self.GetPos()
+                stmt_eas = self.line_to_eas.get(lineno, [])
+                stmt_ea = stmt_eas[0] if stmt_eas else None
+                db.set_numform(self.current_func_ea, stmt_ea or 0, word, "hex")
+                self.show_func(self.current_func_ea)
+                if pos:
+                    try: self.Jump(pos[0], pos[1])
+                    except Exception: pass
+            return
+        pos = self.GetPos()
+        db.set_numform(self.current_func_ea, stmt_ea or 0, hex(val), "offset")
+        self.show_func(self.current_func_ea)
+        if pos:
+            try:
+                self.Jump(pos[0], pos[1])
+            except Exception:
+                pass
+
+    def on_convert_char(self):
+        """Convert numeric constant to character literal (R)."""
+        if self.current_func_ea is None:
+            return
+        text, val, lineno, col, stmt_ea = self.get_literal_under_cursor()
+        if text is None or val is None:
+            return
+        pos = self.GetPos()
+        db.set_numform(self.current_func_ea, stmt_ea or 0, hex(val), "char")
+        self.show_func(self.current_func_ea)
+        if pos:
+            try:
+                self.Jump(pos[0], pos[1])
+            except Exception:
+                pass
+
+    def on_invert_sign(self):
+        """Invert sign of numeric constant (_)."""
+        if self.current_func_ea is None:
+            return
+        text, val, lineno, col, stmt_ea = self.get_literal_under_cursor()
+        if text is None or val is None:
+            return
+        pos = self.GetPos()
+        curr_form = db.get_numform(self.current_func_ea, stmt_ea or 0, hex(val))
+        target_form = "default" if curr_form == "invsign" else "invsign"
+        db.set_numform(self.current_func_ea, stmt_ea or 0, hex(val), target_form)
+        self.show_func(self.current_func_ea)
+        if pos:
+            try:
+                self.Jump(pos[0], pos[1])
+            except Exception:
+                pass
+
+    def on_bitwise_negate(self):
+        """Bitwise negate numeric constant (~)."""
+        if self.current_func_ea is None:
+            return
+        text, val, lineno, col, stmt_ea = self.get_literal_under_cursor()
+        if text is None or val is None:
+            return
+        pos = self.GetPos()
+        curr_form = db.get_numform(self.current_func_ea, stmt_ea or 0, hex(val))
+        target_form = "default" if curr_form == "bnot" else "bnot"
+        db.set_numform(self.current_func_ea, stmt_ea or 0, hex(val), target_form)
+        self.show_func(self.current_func_ea)
+        if pos:
+            try:
+                self.Jump(pos[0], pos[1])
+            except Exception:
+                pass
+
+    def on_edit_comment(self):
+        """Add or edit statement comment for current line (/ or ;)."""
+        if self.current_func_ea is None:
+            return
+        pos = self.GetPos()
+        lineno = pos[0] if pos else 0
+        stmt_eas = self.line_to_eas.get(lineno, [])
+        stmt_ea = stmt_eas[0] if stmt_eas else (self.line_ea[lineno] if lineno < len(self.line_ea) else None)
+        if stmt_ea is None:
+            stmt_ea = self.current_func_ea
+
+        curr_cmt = db.get_statement_cmt(self.current_func_ea, stmt_ea) or ""
+        new_cmt = ida_kernwin.ask_str(curr_cmt, 0, f"Statement Comment (0x{stmt_ea:X}):")
+        if new_cmt is None:
+            return
+        new_cmt = new_cmt.strip()
+        db.set_statement_cmt(self.current_func_ea, stmt_ea, new_cmt)
+        self.show_func(self.current_func_ea)
+        if pos:
+            try:
+                self.Jump(pos[0], pos[1])
+            except Exception:
+                pass
+
+    def on_invert_if(self):
+        """Invert if-condition and swap branches (I)."""
+        if self.current_func_ea is None:
+            return
+        pos = self.GetPos()
+        lineno = pos[0] if pos else 0
+        stmt_eas = self.line_to_eas.get(lineno, [])
+        stmt_ea = stmt_eas[0] if stmt_eas else None
+        if stmt_ea is None:
+            return
+        db.toggle_iflag(self.current_func_ea, stmt_ea)
+        self.show_func(self.current_func_ea)
+        if pos:
+            try:
+                self.Jump(pos[0], pos[1])
+            except Exception:
+                pass
+
+    def on_toggle_casts(self):
+        """Toggle displaying type casts (\\)."""
+        self.show_casts = not getattr(self, "show_casts", True)
+        pos = self.GetPos()
+        self.show_func(self.current_func_ea)
+        if pos:
+            try:
+                self.Jump(pos[0], pos[1])
+            except Exception:
+                pass
+
+    def on_jump_xref(self):
+        """Open cross-references dialog for symbol or address under cursor (X)."""
+        word, lineno = self.get_word_under_cursor()
+        target_ea = None
+        if word:
+            try:
+                import ida_name, ida_idaapi
+                target_ea = ida_name.get_name_ea(ida_idaapi.BADADDR, word)
+                if target_ea == ida_idaapi.BADADDR:
+                    target_ea = None
+            except Exception:
+                pass
+            if target_ea is None:
+                m = _EA.search(word) or _ADDR_HEX.search(word)
+                if m:
+                    try:
+                        target_ea = int(m.group(1), 16)
+                    except ValueError:
+                        pass
+        if target_ea is None:
+            stmt_eas = self.line_to_eas.get(lineno, [])
+            target_ea = stmt_eas[0] if stmt_eas else self.current_func_ea
+
+        if target_ea is not None:
+            try:
+                ida_kernwin.open_xrefs_window(target_ea)
+                return True
+            except Exception:
+                pass
+        return False
+
+    def on_jump_matching_brace(self):
+        """Jump between matching '{' and '}' braces (B)."""
+        pos = self.GetPos()
+        if not pos:
+            return False
+        cur_line, cur_col = pos[0], pos[1]
+        if cur_line < 0 or cur_line >= len(self.raw_lines):
+            return False
+        line = self.raw_lines[cur_line]
+
+        target_line = None
+        if "{" in line and "}" not in line:
+            depth = 1
+            for l in range(cur_line + 1, len(self.raw_lines)):
+                ln = self.raw_lines[l]
+                depth += ln.count("{") - ln.count("}")
+                if depth == 0:
+                    target_line = l
+                    break
+        elif "}" in line and "{" not in line:
+            depth = 1
+            for l in range(cur_line - 1, -1, -1):
+                ln = self.raw_lines[l]
+                depth += ln.count("}") - ln.count("{")
+                if depth == 0:
+                    target_line = l
+                    break
+
+        if target_line is not None:
+            t_line = self.raw_lines[target_line]
+            col = t_line.find("}") if "}" in t_line else (t_line.find("{") if "{" in t_line else 0)
+            self.select_line(target_line, jump=True, update_asm=True, jump_asm=True)
+            self.Jump(target_line, max(0, col))
+            return True
+        return False
+
+    def on_reset_item(self):
+        """Reset custom format, rename, comment, or inversion on item under cursor (Del)."""
+        if self.current_func_ea is None:
+            return
+        pos = self.GetPos()
+        lineno = pos[0] if pos else 0
+        stmt_eas = self.line_to_eas.get(lineno, [])
+        stmt_ea = stmt_eas[0] if stmt_eas else None
+
+        # 1. Statement comment
+        if stmt_ea is not None and db.get_statement_cmt(self.current_func_ea, stmt_ea):
+            db.set_statement_cmt(self.current_func_ea, stmt_ea, None)
+            self.show_func(self.current_func_ea)
+            if pos:
+                try: self.Jump(pos[0], pos[1])
+                except Exception: pass
+            return
+
+        # 2. Number format
+        text, val, _, _, _ = self.get_literal_under_cursor()
+        if val is not None:
+            db.set_numform(self.current_func_ea, stmt_ea or 0, hex(val), "default")
+            self.show_func(self.current_func_ea)
+            if pos:
+                try: self.Jump(pos[0], pos[1])
+                except Exception: pass
+            return
+
+        # 3. Variable rename
+        word, _ = self.get_word_under_cursor()
+        if word:
+            data = db.get_func_data(self.current_func_ea)
+            renames = data.get("renames", {})
+            for orig, user_name in list(renames.items()):
+                if user_name == word or orig == word:
+                    db.set_var_rename(self.current_func_ea, orig, None)
+                    self.show_func(self.current_func_ea)
+                    if pos:
+                        try: self.Jump(pos[0], pos[1])
+                        except Exception: pass
+                    return
+
+        # 4. Inverted if
+        if stmt_ea is not None and db.is_iflag_inverted(self.current_func_ea, stmt_ea):
+            db.toggle_iflag(self.current_func_ea, stmt_ea)
+            self.show_func(self.current_func_ea)
+            if pos:
+                try: self.Jump(pos[0], pos[1])
+                except Exception: pass
+            return
 
     def get_word_under_cursor(self):
         """Return the identifier under cursor and the line number."""
@@ -629,6 +947,37 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         if vkey in (ord('Y'), ord('y')):
             self.on_set_type()
             return True
+        if vkey in (ord('H'), ord('h')):
+            self.on_toggle_hex_dec()
+            return True
+        if vkey in (ord('O'), ord('o')):
+            self.on_convert_offset()
+            return True
+        if vkey in (ord('R'), ord('r')):
+            self.on_convert_char()
+            return True
+        if vkey in (ord('_'), ord('-'), 189):
+            self.on_invert_sign()
+            return True
+        if vkey in (ord('~'), 192):
+            self.on_bitwise_negate()
+            return True
+        if vkey in (ord('/'), ord(';'), 191, 186):
+            self.on_edit_comment()
+            return True
+        if vkey in (ord('I'), ord('i')):
+            self.on_invert_if()
+            return True
+        if vkey in (ord('\\'), 220):
+            self.on_toggle_casts()
+            return True
+        if vkey in (ord('X'), ord('x')):
+            return self.on_jump_xref()
+        if vkey in (ord('B'), ord('b')):
+            return self.on_jump_matching_brace()
+        if vkey == 46:  # VK_DELETE
+            self.on_reset_item()
+            return True
         if vkey == 116:  # F5
             if self.current_func_ea is not None:
                 self.show_func(self.current_func_ea)
@@ -763,10 +1112,28 @@ class _UiHooks(ida_kernwin.UI_Hooks):
         if widget != view_widget:
             return
 
+        # Contextual modifications
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_RENAME)
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_SET_TYPE)
-        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_TOGGLE_SYNC)
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_EDIT_COMMENT)
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_RESET_ITEM)
+
+        # Number format conversions
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_TOGGLE_HEX_DEC)
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_CVT_CHAR)
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_CVT_OFFSET)
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_INVERT_SIGN)
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_BITWISE_NEGATE)
+
+        # Structure / flow
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_INVERT_IF)
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_TOGGLE_CASTS)
+
+        # Navigation & refresh
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_JUMP_XREF)
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_JUMP_BRACE)
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_JUMP_DISASM)
+        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_TOGGLE_SYNC)
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_REFRESH)
 
 
@@ -791,11 +1158,43 @@ class _CustViewHooks(ida_kernwin.View_Hooks):
             self.view.clear_asm_highlights()
 
 
+ALL_DECOMPILER_ACTIONS = [
+    ACTION_DECOMPILE,
+    ACTION_RENAME,
+    ACTION_SET_TYPE,
+    ACTION_EDIT_COMMENT,
+    ACTION_RESET_ITEM,
+    ACTION_TOGGLE_HEX_DEC,
+    ACTION_CVT_CHAR,
+    ACTION_CVT_OFFSET,
+    ACTION_INVERT_SIGN,
+    ACTION_BITWISE_NEGATE,
+    ACTION_INVERT_IF,
+    ACTION_TOGGLE_CASTS,
+    ACTION_JUMP_XREF,
+    ACTION_JUMP_BRACE,
+    ACTION_TOGGLE_SYNC,
+    ACTION_JUMP_DISASM,
+    ACTION_REFRESH,
+]
+
+
 def _register_actions(view):
     """Register IDA actions for popup menu."""
     actions = [
         (ACTION_RENAME, "Rename variable/symbol... (N)", view.on_rename),
         (ACTION_SET_TYPE, "Set variable/function type... (Y)", view.on_set_type),
+        (ACTION_EDIT_COMMENT, "Edit statement comment... (/)", view.on_edit_comment),
+        (ACTION_RESET_ITEM, "Reset item to default (Del)", view.on_reset_item),
+        (ACTION_TOGGLE_HEX_DEC, "Toggle Hex/Decimal (H)", view.on_toggle_hex_dec),
+        (ACTION_CVT_CHAR, "Convert to character constant (R)", view.on_convert_char),
+        (ACTION_CVT_OFFSET, "Convert to offset/symbol (O)", view.on_convert_offset),
+        (ACTION_INVERT_SIGN, "Invert sign (_)", view.on_invert_sign),
+        (ACTION_BITWISE_NEGATE, "Bitwise negate (~)", view.on_bitwise_negate),
+        (ACTION_INVERT_IF, "Invert if-condition (I)", view.on_invert_if),
+        (ACTION_TOGGLE_CASTS, "Toggle type casts (\\)", view.on_toggle_casts),
+        (ACTION_JUMP_XREF, "Jump to xref (X)", view.on_jump_xref),
+        (ACTION_JUMP_BRACE, "Jump to matching brace (B)", view.on_jump_matching_brace),
         (ACTION_TOGGLE_SYNC, "Sync with Disassembly (Tab)", view.toggle_sync),
         (ACTION_JUMP_DISASM, "Jump to Disassembly / Callee (Enter)", view.jump_disasm),
         (ACTION_REFRESH, "Refresh Decompilation (F5)", lambda: view.show_func(view.current_func_ea)),
@@ -891,7 +1290,7 @@ def cleanup():
         except Exception:
             pass
         _view_hooks = None
-    for action_id in [ACTION_DECOMPILE, ACTION_RENAME, ACTION_SET_TYPE, ACTION_TOGGLE_SYNC, ACTION_JUMP_DISASM, ACTION_REFRESH]:
+    for action_id in ALL_DECOMPILER_ACTIONS:
         try:
             ida_kernwin.unregister_action(action_id)
         except Exception:
